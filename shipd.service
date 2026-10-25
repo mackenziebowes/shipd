@@ -1,0 +1,12 @@
+# A user unit, not installed. To run it: copy to ~/.config/systemd/user/, then systemctl --user enable --now shipd.service
+[Unit]
+Description=shipd: deploy a site's main when every gate passes (dry-run for personal-site)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/shipd watch
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

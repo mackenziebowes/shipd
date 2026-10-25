@@ -1,0 +1,29 @@
+# shipd's sites. Stage 1 runs personal-site in dry-run only: gates run for real, and deploys are only printed.
+# Shipd never flips mode itself; a person changes the line below, once the dry-run record has earned it.
+[[site]]
+name = "personal-site"
+repo = "~/dev/products/mbsi/personal-site"
+branch = "main"
+mode = "dry-run"
+deploy = ["tools/deploy/deploy", "production"]
+
+[[site.gates]]
+name = "build"
+command = ["sh", "-c", '''cargo build --release --manifest-path tools/sitec/Cargo.toml --target-dir "$SHIPD_TARGET"''']
+
+[[site.gates]]
+name = "sitec check"
+command = ["sh", "-c", '''"$SHIPD_TARGET/release/sitec" check''']
+
+[[site.gates]]
+name = "links"
+command = ["sh", "-c", '''out="$(mktemp -d)/site"; "$SHIPD_TARGET/release/sitec" build --out "$out" > /dev/null || exit 1; bad=0; for t in $(grep -v '^#' site/static/_redirects | awk 'NF>=2 {print $2}' | grep '^/' | grep -v ':'); do p="${t#/}"; if [ -e "$out/$p" ] || [ -e "$out/$p.html" ] || [ -e "$out/$p/index.html" ]; then :; else echo "redirect target has no page: $t"; bad=1; fi; done; rm -rf "$(dirname "$out")"; exit $bad''']
+
+[[site.gates]]
+name = "hostmsg"
+command = ["bun", "tools/check-hostmsg.ts"]
+
+# The live home page must answer 200. Stage 2 adds the changed URLs and the strings the diff removed.
+[[site.verify]]
+url = "https://www.mackenziebowes.com/"
+must_not_contain = []
