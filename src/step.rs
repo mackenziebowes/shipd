@@ -64,13 +64,10 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
             waiting(kept, live, candidate, commit, gates)
         }
 
-        // Deploying: the deploy command's result decides between Verifying and Failed.
+        // Deploying: the deploy command's result decides between Verifying and Failed. The tag waits for a verified deploy.
         (S::Deploying { previous, candidate }, E::Deployed) => {
             let now = LiveTag { n: previous.n + 1, commit: candidate.clone() };
-            (
-                S::Verifying { previous, now: now.clone() },
-                vec![Effect::Tag(now), Effect::VerifyLive],
-            )
+            (S::Verifying { previous, now }, vec![Effect::VerifyLive])
         }
         (S::Deploying { previous, candidate }, E::DeployFailed { why }) => {
             let text = format!("deploy of {} failed: {}. Live is still {}", candidate.short(), why, previous.name());
@@ -83,10 +80,13 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
             waiting(kept, live, candidate, commit, gates)
         }
 
-        // Verifying: the live URLs decide. Passing makes the new tag live; failing rolls back to the previous tag.
+        // Verifying: the live URLs decide. Passing tags the new live/<n> and makes it live; failing rolls back, with no tag.
         (S::Verifying { previous, now }, E::Verified) => {
             let text = format!("live is {} at {}", now.name(), now.commit.short());
-            (S::Idle { live: now, previous }, vec![Effect::Report(Where::Console, text)])
+            (
+                S::Idle { live: now.clone(), previous },
+                vec![Effect::Tag(now), Effect::Report(Where::Console, text)],
+            )
         }
         (S::Verifying { previous, now }, E::VerifyFailed { why }) => {
             let text = format!("the live check failed: {}. Rolling back to {}", why, previous.name());
