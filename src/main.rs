@@ -11,7 +11,7 @@ use driver::Run;
 use std::path::PathBuf;
 use std::time::Duration;
 use store::Paths;
-use types::Site;
+use types::{ShipState, Site};
 
 const USAGE: &str = "shipd: deploys a site's main when every gate passes.
 
@@ -112,9 +112,11 @@ fn status(config_path: &PathBuf, paths: &Paths, args: &[String]) -> Result<(), S
             Some(state) => println!("  state: {}", driver::words(&state)),
             None => println!("  state: nothing yet. Run `shipd watch --once` to start it."),
         }
-        match driver::last_gate_failure(paths, &site.name) {
-            Some((gate, report)) => println!("  last gate failure: \"{gate}\": {}", report.lines().last().unwrap_or("")),
-            None => println!("  last gate failure: none"),
+        // a gate failure is news only while its candidate is still blocked: once the state moves on, it is history
+        if let Some(ShipState::Blocked { .. }) = store::load_state(paths, &site.name)? {
+            if let Some((gate, report)) = driver::last_gate_failure(paths, &site.name) {
+                println!("  last gate failure: \"{gate}\": {}", report.lines().last().unwrap_or(""));
+            }
         }
         match site.mode {
             types::Mode::DryRun => println!("  mode: dry-run (config says so; shipd never flips itself)"),
@@ -130,17 +132,24 @@ fn watch(config_path: &PathBuf, paths: &Paths, args: &[String]) -> Result<(), St
     let once = has(args, "--once");
     let sites = config::read(config_path)?;
     loop {
+        let mut loud: Vec<String> = Vec::new();
         for site in &sites {
             let dry = driver::is_dry(site, has(args, "--dry-run"));
             println!("{}: {}", site.name, if dry { "dry-run pass" } else { "live pass" });
             let run = Run { site, paths, dry };
             match driver::watch_site(&run) {
-                Ok(state) => println!("  {}: {}", site.name, driver::words(&state)),
+                Ok(state) => {
+                    println!("  {}: {}", site.name, driver::words(&state));
+                    if matches!(state, ShipState::RollbackFailed { .. }) {
+                        loud.push(site.name.clone());
+                    }
+                }
                 Err(e) => println!("  {}: this pass failed: {e}", site.name),
             }
         }
         if once {
-            return Ok(());
+            // a failed rollback never goes quiet: the pass that ends in one exits non-zero
+            return if loud.is_empty() { Ok(()) } else { Err(format!("a rollback failed on {}; see the status line above", loud.join(", "))) };
         }
         std::thread::sleep(Duration::from_secs(60));
     }
@@ -153,6 +162,9 @@ fn rollback(config_path: &PathBuf, paths: &Paths, args: &[String]) -> Result<(),
     let run = Run { site: &site, paths, dry };
     let state = driver::rollback_site(&run)?;
     println!("{}: {}", site.name, driver::words(&state));
+    if matches!(state, ShipState::RollbackFailed { .. }) {
+        return Err("the rollback failed, and the rejected commit may still be live".into());
+    }
     Ok(())
 }
 

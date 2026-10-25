@@ -1,14 +1,22 @@
 //! The whole transition table for one site, as one match, read top to bottom. Each arm is one row of the design's table.
-//! Pure: no clock, no IO. `gates` is the site's ordered gate list, passed in because "the next gate" needs it.
-//! An event a state does not expect comes back as a Report with words; nothing panics and nothing is dropped.
+//! Pure: no clock, no IO. The `Plan` is the site's ordered gates, and the highest live/<n> number git and the state already
+//! use, both passed in because "the next gate" and "the next number" need them. An event a state does not expect comes back
+//! as a Report with words; nothing panics and nothing is dropped.
 use crate::types::*;
 use crate::words::describe;
 
 type Step = (ShipState, Vec<Effect>);
 
-pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
+pub struct Plan<'a> {
+    pub gates: &'a [Gate],
+    /// The highest live/<n> in git or in the state. The next deploy's tag is one more; a number is never reused.
+    pub highest: u32,
+}
+
+pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
     use ShipEvent as E;
     use ShipState as S;
+    let gates = plan.gates;
     match (state, event) {
         // Idle: origin's main moving ahead starts the gates. The live commit itself changes nothing.
         (S::Idle { live, previous }, E::OriginMoved { commit }) => {
@@ -66,7 +74,7 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
 
         // Deploying: the deploy command's result decides between Verifying and Failed. The tag waits for a verified deploy.
         (S::Deploying { previous, candidate }, E::Deployed) => {
-            let now = LiveTag { n: previous.n + 1, commit: candidate.clone() };
+            let now = LiveTag { n: plan.highest + 1, commit: candidate.clone() };
             (S::Verifying { previous, now }, vec![Effect::VerifyLive])
         }
         (S::Deploying { previous, candidate }, E::DeployFailed { why }) => {
@@ -80,9 +88,9 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
             waiting(kept, live, candidate, commit, gates)
         }
 
-        // Verifying: the live URLs decide. Passing tags the new live/<n> and makes it live; failing rolls back, with no tag.
+        // Verifying: the live checks decide. Passing tags the new live/<n> and makes it live; failing rolls back, with no tag.
         (S::Verifying { previous, now }, E::Verified) => {
-            let text = format!("live is {} at {}", now.name(), now.commit.short());
+            let text = format!("{} at {} passed the live checks", now.name(), now.commit.short());
             (
                 S::Idle { live: now.clone(), previous },
                 vec![Effect::Tag(now), Effect::Report(Where::Console, text)],
@@ -105,7 +113,20 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
                 why
             );
             (
-                S::Held { live: to, rejected: failed.commit, why },
+                S::Held { live: to, rejected: failed, why },
+                vec![Effect::Report(Where::Console, text)],
+            )
+        }
+        // The redeploy itself failed: the rejected commit may still be live. This is loud, and it stays loud.
+        (S::RollingBack { failed, to, why }, E::RedeployFailed { why: redeploy_why }) => {
+            let text = format!(
+                "rollback to {} failed: {}. {} may still be live; nothing has fixed it",
+                to.name(),
+                redeploy_why,
+                failed.commit.short()
+            );
+            (
+                S::RollbackFailed { live: to, rejected: failed, why },
                 vec![Effect::Report(Where::Console, text)],
             )
         }
@@ -113,8 +134,31 @@ pub fn step(state: ShipState, event: ShipEvent, gates: &[Gate]) -> Step {
         // Held: the rejected commit is not redeployed. A newer commit starts the gates again.
         (S::Held { live, rejected, why }, E::OriginMoved { commit }) => {
             let kept = S::Held { live: live.clone(), rejected: rejected.clone(), why };
-            waiting(kept, live, rejected, commit, gates)
+            waiting(kept, live, rejected.commit, commit, gates)
         }
+
+        // RollbackFailed: reported again on every pass, until a newer commit leaves it for Gating, as Held does.
+        (S::RollbackFailed { live, rejected, why }, E::OriginMoved { commit }) => {
+            if commit == rejected.commit {
+                let text = format!("still not fixed: {} may be live, and the rollback to {} failed: {}", rejected.commit.short(), live.name(), why);
+                say(S::RollbackFailed { live, rejected, why }, text)
+            } else {
+                let kept = S::RollbackFailed { live: live.clone(), rejected: rejected.clone(), why };
+                waiting(kept, live, rejected.commit, commit, gates)
+            }
+        }
+
+        // Resumed: a state that was killed mid-effect runs that effect again. Deploys are idempotent by commit.
+        (S::Gating { live, candidate, .. }, E::Resumed) => start(live, candidate, gates),
+        (S::Deploying { previous, candidate }, E::Resumed) => (
+            S::Deploying { previous: previous.clone(), candidate: candidate.clone() },
+            vec![Effect::Deploy(candidate)],
+        ),
+        (S::Verifying { previous, now }, E::Resumed) => (S::Verifying { previous, now }, vec![Effect::VerifyLive]),
+        (S::RollingBack { failed, to, why }, E::Resumed) => (
+            S::RollingBack { failed, to: to.clone(), why },
+            vec![Effect::Redeploy(to)],
+        ),
 
         // Anything else: the state keeps what it has, and the report says why nothing changed.
         (s, e) => {
@@ -161,6 +205,7 @@ fn event_name(event: &ShipEvent) -> &'static str {
         ShipEvent::Deployed | ShipEvent::DeployFailed { .. } => "a deploy result",
         ShipEvent::Verified | ShipEvent::VerifyFailed { .. } => "a live check result",
         ShipEvent::RollbackRequested => "a rollback request",
-        ShipEvent::RollbackDone => "a finished rollback",
+        ShipEvent::RollbackDone | ShipEvent::RedeployFailed { .. } => "a redeploy result",
+        ShipEvent::Resumed => "a restart",
     }
 }

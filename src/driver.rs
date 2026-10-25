@@ -1,7 +1,7 @@
 //! The adapter: runs what `step` asks for, and turns each result back into an event. Git, gates, the deploy command and the
-//! live checks happen here, never in `step`. In dry-run the Deploy, Tag and Redeploy effects are only printed, and the
-//! machine proceeds as if they passed; gates and the live checks still run for real.
-use crate::step::step;
+//! live checks happen here, never in `step`. In dry-run the Deploy, Tag and Redeploy effects are only printed, the live
+//! checks run only the status check, and the machine proceeds as if they passed. In live mode everything is real.
+use crate::step::{step, Plan};
 use crate::store::{self, Paths};
 use crate::types::*;
 use crate::words::describe;
@@ -74,14 +74,23 @@ pub fn clean_work(run: &Run) {
     }
 }
 
+/// The highest live/<n> in git, or 0. Tags are never deleted, so this only grows.
+fn highest_tag_in_git(site: &Site) -> Result<u32, String> {
+    let names = git(&site.repo, &["tag", "--list", "live/*"])?;
+    Ok(names.lines().filter_map(|l| l.strip_prefix("live/")?.parse::<u32>().ok()).max().unwrap_or(0))
+}
+
 /// Feeds events through `step` until none are left, running each effect and recording it. Saves the state after each event.
+/// The highest number is read from git and the state once per call, so a number that was used is never handed out again.
 pub fn settle(run: &Run, state: ShipState, events: Vec<ShipEvent>) -> Result<ShipState, String> {
     let name = &run.site.name;
+    let highest = highest_tag_in_git(run.site)?.max(state.highest_number());
     let mut queue: VecDeque<ShipEvent> = events.into();
     let mut state = state;
     while let Some(event) = queue.pop_front() {
         store::append(run.paths, name, "event", json!({ "event": event }))?;
-        let (next, effects) = step(state, event, &run.site.gates);
+        let plan = Plan { gates: &run.site.gates, highest };
+        let (next, effects) = step(state, event, &plan);
         state = next;
         store::save_state(run.paths, name, &state)?;
         for effect in effects {
@@ -143,14 +152,18 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
         }
         Effect::Tag(tag) => {
             if run.dry {
-                say(format!("would tag {} at {}", tag.name(), tag.commit.short()));
-            } else {
-                git(&site.repo, &["tag", &tag.name(), tag.commit.as_str()])?;
-                say(format!("tagged {} at {}", tag.name(), tag.commit.short()));
+                say(format!("would tag {} at {}: that would be live", tag.name(), tag.commit.short()));
+                return Ok(vec![]);
             }
+            // a tag that exists is never moved: a rolled-back commit keeps its number
+            if !git(&site.repo, &["tag", "--list", &tag.name()])?.is_empty() {
+                return Err(format!("{} already exists; tags are never moved, so the number is not reused", tag.name()));
+            }
+            git(&site.repo, &["tag", &tag.name(), tag.commit.as_str()])?;
+            say(format!("tagged {} at {}", tag.name(), tag.commit.short()));
             Ok(vec![])
         }
-        Effect::VerifyLive => Ok(match verify(site) {
+        Effect::VerifyLive => Ok(match verify(site, run.dry) {
             None => vec![ShipEvent::Verified],
             Some(why) => vec![ShipEvent::VerifyFailed { why }],
         }),
@@ -165,8 +178,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 say(format!("redeployed {} ({}) to {}", tag.name(), tag.commit.short(), site.name));
                 Ok(vec![ShipEvent::RollbackDone])
             } else {
-                say(format!("redeploy of {} failed, and live is not what it should be: {}", tag.name(), tail(&text, 20)));
-                Ok(vec![])
+                Ok(vec![ShipEvent::RedeployFailed { why: tail(&text, 20) }])
             }
         }
         Effect::Report(_, text) => {
@@ -180,9 +192,27 @@ fn say(text: String) {
     println!("{text}");
 }
 
-/// The live URLs: each must answer 200 and must not contain any string the change removed. None means they pass.
-fn verify(site: &Site) -> Option<String> {
+/// The live URLs. Each must answer 200. In live mode each must also not contain any string the change removed; in dry-run
+/// that check is only printed, because the live site still has those strings until a real deploy. None means they pass.
+fn verify(site: &Site, dry: bool) -> Option<String> {
     for check in &site.verify {
+        if dry {
+            let out = match Command::new("curl").args(["-sS", "--max-time", "20", "-o", "/dev/null", "-w", "%{http_code}", &check.url]).output() {
+                Ok(out) => out,
+                Err(e) => return Some(format!("cannot run curl for {}: {e}", check.url)),
+            };
+            if !out.status.success() {
+                return Some(format!("{} could not be reached: {}", check.url, String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if code != "200" {
+                return Some(format!("{} answered {}, not 200", check.url, code));
+            }
+            for s in &check.must_not_contain {
+                say(format!("would check the live page does not contain \"{s}\""));
+            }
+            continue;
+        }
         let out = match Command::new("curl").args(["-sS", "--max-time", "20", "-o", "-", "-w", "\n%{http_code}", &check.url]).output() {
             Ok(out) => out,
             Err(e) => return Some(format!("cannot run curl for {}: {e}", check.url)),
@@ -229,8 +259,8 @@ pub fn initial_state(site: &Site, head: &Commit) -> Result<ShipState, String> {
     })
 }
 
-/// One pass for one site: fetch origin, send it the commit on origin's branch, run what the machine asks for, and resolve
-/// the dry-run counter from the history.
+/// One pass for one site. A state killed mid-effect is resumed first, so its effect runs again; then origin's branch head
+/// is sent. The dry-run counter is resolved from the history at the end.
 pub fn watch_site(run: &Run) -> Result<ShipState, String> {
     let site = run.site;
     git(&site.repo, &["fetch", "origin"])?;
@@ -243,7 +273,10 @@ pub fn watch_site(run: &Run) -> Result<ShipState, String> {
             state
         }
     };
-    let result = settle(run, state, vec![ShipEvent::OriginMoved { commit: head }]);
+    let result = (|| {
+        let state = if state.is_mid_flight() { settle(run, state, vec![ShipEvent::Resumed])? } else { state };
+        settle(run, state, vec![ShipEvent::OriginMoved { commit: head }])
+    })();
     clean_work(run);
     let state = result?;
     resolve(run)?;

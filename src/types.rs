@@ -38,6 +38,26 @@ impl LiveTag {
     }
 }
 
+impl ShipState {
+    /// The highest live/<n> number this state has used, rejected ones included: a number is never reused.
+    pub fn highest_number(&self) -> u32 {
+        let tags: Vec<&LiveTag> = match self {
+            ShipState::Idle { live, previous } => vec![live, previous],
+            ShipState::Gating { live, .. } | ShipState::Blocked { live, .. } | ShipState::Failed { live, .. } => vec![live],
+            ShipState::Deploying { previous, .. } => vec![previous],
+            ShipState::Verifying { previous, now } => vec![previous, now],
+            ShipState::RollingBack { failed, to, .. } => vec![failed, to],
+            ShipState::Held { live, rejected, .. } | ShipState::RollbackFailed { live, rejected, .. } => vec![live, rejected],
+        };
+        tags.iter().map(|t| t.n).max().unwrap_or(0)
+    }
+
+    /// A state a process can be killed in the middle of: its effect has to run again.
+    pub fn is_mid_flight(&self) -> bool {
+        matches!(self, ShipState::Gating { .. } | ShipState::Deploying { .. } | ShipState::Verifying { .. } | ShipState::RollingBack { .. })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GateName(String);
@@ -93,7 +113,9 @@ pub enum ShipState {
     /// The live check failed, or a person asked. The previous tag is being redeployed.
     RollingBack { failed: LiveTag, to: LiveTag, why: String },
     /// A rollback finished. Main is ahead of live on purpose: `rejected` stays on main and is not redeployed until main moves past it.
-    Held { live: LiveTag, rejected: Commit, why: String },
+    Held { live: LiveTag, rejected: LiveTag, why: String },
+    /// The rollback's redeploy failed. `rejected` may still be live. This is loud: it is reported on every pass until a newer commit arrives.
+    RollbackFailed { live: LiveTag, rejected: LiveTag, why: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +129,9 @@ pub enum ShipEvent {
     VerifyFailed { why: String },
     RollbackRequested,
     RollbackDone,
+    RedeployFailed { why: String },
+    /// Sent first on a pass that finds a state mid-flight (a process killed during an effect): the state re-runs its effect.
+    Resumed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
