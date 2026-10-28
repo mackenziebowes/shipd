@@ -40,7 +40,7 @@ mode = "dry-run"
 deploy = ["bun", "deploy.ts", "production"]
 version_line = "Current Version ID:"
 land = ["data/published-urls.txt"]
-serve_check = ["https://okanaganregister.com/", "https://okanaganregister.com/sitemap.xml"]
+serve_check = ["https://okanaganregister.com/", "https://okanaganregister.com/sitemap.xml", "https://okanaganregister.com/ask/", "https://okanaganregister.com/fix/", "https://okanaganregister.com/how/", "https://okanaganregister.com/privacy/", "https://okanaganregister.com/fix/known.json", "https://okanaganregister.com/kelowna/", "https://okanaganregister.com/kelowna/clinic/", "https://okanaganregister.com/kelowna/clinic/123-dentist-inc-4062485/"]
 
 [[site.gates]]
 name = "tests"
