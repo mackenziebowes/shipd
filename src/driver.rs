@@ -30,24 +30,54 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Runs a command in `dir`, with SHIPD_TARGET set to the site's shared build directory. Returns success and the output.
-fn run_in(cmd: &[String], dir: &Path, target: &Path, out: Option<&Path>) -> (bool, String) {
+/// The longest any one command may run. A build or a gate that hangs fails with a message instead of hanging shipd.
+const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Runs a command in `dir`, with SHIPD_TARGET set to the site's shared build directory, SHIPD_RELEASE set (a site's own deploy script
+/// refuses to deploy to production without it) and any `extra` variables. Returns success and the output.
+fn run_in(cmd: &[String], dir: &Path, target: &Path, extra: &[(&str, &Path)]) -> (bool, String) {
+    use std::io::Read;
+    use std::process::Stdio;
     let Some((prog, rest)) = cmd.split_first() else {
         return (false, "the command is empty".into());
     };
-    // SHIPD_RELEASE tells a site's own deploy script that shipd is running it: a deploy script refuses to run without it.
     let mut command = Command::new(prog);
-    command.args(rest).current_dir(dir).env("SHIPD_TARGET", target).env("SHIPD_RELEASE", "1");
-    if let Some(out) = out {
-        command.env("SHIPD_OUT", out);
+    command.args(rest).current_dir(dir).env("SHIPD_TARGET", target).env("SHIPD_RELEASE", "1").stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (name, value) in extra {
+        command.env(name, value);
     }
-    match command.output() {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            (out.status.success(), text)
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("cannot run {prog}: {e}")),
+    };
+    let readers: Vec<std::thread::JoinHandle<String>> = [child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>)]
+        .into_iter()
+        .flatten()
+        .map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stream.read_to_end(&mut bytes);
+                String::from_utf8_lossy(&bytes).to_string()
+            })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() > COMMAND_LIMIT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("{prog} ran over {} minutes and was stopped", COMMAND_LIMIT.as_secs() / 60));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => break Err(format!("cannot wait for {prog}: {e}")),
         }
-        Err(e) => (false, format!("cannot run {prog}: {e}")),
+    };
+    let text: String = readers.into_iter().map(|r| r.join().unwrap_or_default()).collect();
+    match status {
+        Ok(status) => (status.success(), text),
+        Err(why) => (false, format!("{text}\n{why}")),
     }
 }
 
@@ -61,6 +91,8 @@ fn ensure_work(run: &Run, commit: &Commit) -> Result<PathBuf, String> {
     let work = run.paths.work(&run.site.name);
     if work.exists() {
         git(&work, &["checkout", "--detach", "-f", commit.as_str()])?;
+        // nothing the previous build left behind (untracked or ignored files) may reach this one
+        git(&work, &["clean", "-fdxq"])?;
     } else {
         std::fs::create_dir_all(run.paths.site_dir(&run.site.name)).map_err(|e| e.to_string())?;
         let work_text = work.to_string_lossy().to_string();
@@ -74,7 +106,7 @@ fn build_into(run: &Run, build: &[String], commit: &Commit, out: &Path) -> Resul
     let work = ensure_work(run, commit)?;
     let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(out).map_err(|e| format!("cannot make {}: {e}", out.display()))?;
-    let (ok, text) = run_in(build, &work, &run.paths.target(&run.site.name), Some(out));
+    let (ok, text) = run_in(build, &work, &run.paths.target(&run.site.name), &[("SHIPD_OUT", out)]);
     if ok {
         Ok(())
     } else {
@@ -92,11 +124,11 @@ fn make_diff(run: &Run, build: &[String], live: &Commit, candidate: &Commit) -> 
         let summary = crate::diff::diff_trees(&crate::diff::Tree::read(&live_out)?, &crate::diff::Tree::read(&next_out)?);
         Ok(summary.report(40))
     })();
+    // The live build is only for the comparison. The candidate's folder is kept: it is what the approval is about, and what the deploy ships.
     let _ = std::fs::remove_dir_all(&live_out);
-    let _ = std::fs::remove_dir_all(&next_out);
-    // a builder may leave a file beside its output folder (generate.ts writes <out>.urls.txt); nothing of the diff stays behind
-    for name in ["diff-live.urls.txt", "diff-next.urls.txt"] {
-        let _ = std::fs::remove_file(dir.join(name));
+    let _ = std::fs::remove_file(dir.join("diff-live.urls.txt"));
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&next_out);
     }
     result
 }
@@ -171,7 +203,7 @@ fn effect_words(effect: &Effect) -> String {
         Effect::FetchWorktree(c) => format!("fetch a worktree at {}", c.short()),
         Effect::MakeDiff { live, candidate } => format!("build {} and {} and compare them", live.short(), candidate.short()),
         Effect::RunGate(g) => format!("run gate \"{}\"", g.name.as_str()),
-        Effect::Deploy(c) => format!("deploy {}", c.short()),
+        Effect::Deploy { commit, .. } => format!("deploy {}", commit.short()),
         Effect::Tag(t) => format!("tag {}", t.name()),
         Effect::VerifyLive => "check the live site".into(),
         Effect::Redeploy(t) => format!("redeploy {}", t.name()),
@@ -199,7 +231,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
         }
         Effect::RunGate(gate) => {
             let work = run.paths.work(&site.name);
-            let (ok, text) = run_in(&gate.command, &work, &target, None);
+            let (ok, text) = run_in(&gate.command, &work, &target, &[]);
             if ok {
                 Ok(vec![ShipEvent::GateDone { gate: gate.name, outcome: GateOutcome::Passed }])
             } else {
@@ -208,14 +240,27 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 Ok(vec![ShipEvent::GateDone { gate: gate.name, outcome: GateOutcome::Failed { report } }])
             }
         }
-        Effect::Deploy(commit) => {
+        Effect::Deploy { commit, built } => {
             if run.dry {
                 say(format!("would deploy {} to {}", commit.short(), site.name));
                 store::append(run.paths, &site.name, "would_have_deployed", json!({ "commit": commit.as_str() }))?;
                 return Ok(vec![ShipEvent::Deployed { version: VersionId::NotReported }]);
             }
             let work = ensure_work(run, &commit)?;
-            let (ok, text) = run_in(&site.deploy, &work, &target, None);
+            // With a diff step the approved folder was kept. It is hashed again now, and the deploy is handed it: what ships is what a person saw.
+            let kept = run.paths.site_dir(&site.name).join("diff-next");
+            let (ok, text) = match &built {
+                Built::BySiteDeploy => run_in(&site.deploy, &work, &target, &[]),
+                Built::KeptFolder { tree_digest } => match crate::diff::Tree::read(&kept) {
+                    Ok(tree) if tree.digest() == *tree_digest => run_in(&site.deploy, &work, &target, &[("SHIPD_APPROVED_DIR", kept.as_path())]),
+                    Ok(_) => (false, format!("the folder that was approved ({}) changed on disk after the diff was made; nothing was deployed. Run the release again.", kept.display())),
+                    Err(e) => (false, format!("the folder that was approved is not there to deploy: {e}. Run the release again.")),
+                },
+            };
+            if matches!(built, Built::KeptFolder { .. }) {
+                let _ = std::fs::remove_dir_all(&kept);
+                let _ = std::fs::remove_file(run.paths.site_dir(&site.name).join("diff-next.urls.txt"));
+            }
             if ok {
                 say(format!("deployed {} to {}", commit.short(), site.name));
                 Ok(vec![ShipEvent::Deployed { version: version_in(&site.version, &text) }])
@@ -246,7 +291,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 return Ok(vec![ShipEvent::RollbackDone]);
             }
             let work = ensure_work(run, &tag.commit)?;
-            let (ok, text) = run_in(&site.deploy, &work, &target, None);
+            let (ok, text) = run_in(&site.deploy, &work, &target, &[]);
             if ok {
                 say(format!("redeployed {} ({}) to {}", tag.name(), tag.commit.short(), site.name));
                 Ok(vec![ShipEvent::RollbackDone])

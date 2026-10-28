@@ -110,7 +110,7 @@ pub enum ShipState {
     Diffing { live: LiveTag, candidate: Commit },
     /// The diff was made and shown, and a person has to approve exactly this diff (its digest) before anything deploys.
     Diffed { live: LiveTag, candidate: Commit, report: DiffReport },
-    Deploying { previous: LiveTag, candidate: Commit },
+    Deploying { previous: LiveTag, candidate: Commit, built: Built },
     /// The deploy ran. The live URLs are being checked, and `now` is the tag that would be live. `version` is the platform's id for it.
     Verifying { previous: LiveTag, now: LiveTag, version: VersionId },
     /// The deploy command itself failed. Live is still `live`.
@@ -150,7 +150,7 @@ pub enum Effect {
     /// Build `live` and `candidate` into two folders and compare them.
     MakeDiff { live: Commit, candidate: Commit },
     RunGate(Gate),
-    Deploy(Commit),
+    Deploy { commit: Commit, built: Built },
     Tag(LiveTag),
     VerifyLive,
     Redeploy(LiveTag),
@@ -162,6 +162,15 @@ pub enum Effect {
 pub enum Mode {
     DryRun,
     Live,
+}
+
+/// What the deploy ships. With a diff step, the folder that was built and approved is kept, and the deploy is handed it and held to its digest;
+/// without one, the site's deploy command builds for itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "built", rename_all = "snake_case")]
+pub enum Built {
+    BySiteDeploy,
+    KeptFolder { tree_digest: String },
 }
 
 /// Where a site's branch lives: on a remote (fetched before every pass), or only in the local repo (for a site with no remote).

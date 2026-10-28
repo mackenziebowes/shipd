@@ -24,7 +24,7 @@ pub fn describe(state: &ShipState) -> String {
             report.digest.get(..12).unwrap_or(&report.digest),
             if report.flagged.is_empty() { String::new() } else { format!(" --allow {}", report.flagged.iter().map(|k| k.name()).collect::<Vec<_>>().join(",")) }
         ),
-        ShipState::Deploying { previous, candidate } => format!("deploying {} over {}", candidate.short(), previous.name()),
+        ShipState::Deploying { previous, candidate, .. } => format!("deploying {} over {}", candidate.short(), previous.name()),
         ShipState::Verifying { now, .. } => format!("checking {} ({}) against the live checks", now.name(), now.commit.short()),
         ShipState::Failed { live, candidate, why } => format!(
             "deploy of {} failed: {}. Live is still {}",

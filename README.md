@@ -30,6 +30,11 @@ output line that starts with `version_line`) and the rollback line.
    diff, so a different diff cannot be approved by mistake, and a new commit on the branch replaces the waiting diff. Either way, a diff that changes
    routing or code files waits for `--allow routing,code`.
 3. **A page removed with no redirect** in the candidate's `_redirects` blocks the release.
-4. **Hand deploys.** shipd sets `SHIPD_RELEASE=1` for the gates, the build and the deploy. A site's own deploy script refuses to deploy to production
-   without it.
-5. **No remote.** `remote = "none"` makes the local branch the truth.
+4. **What ships is what was approved.** With a diff step, the candidate folder built for the diff is kept, its tree digest is carried in the
+   state, and the deploy command is run with `SHIPD_APPROVED_DIR` set to it. A site's deploy script must ship that folder and not build again. shipd
+   hashes the folder once more just before the deploy and refuses if it changed. A deploy script that ignores `SHIPD_APPROVED_DIR` and builds for
+   itself would ship a build nobody saw: the site's deploy script is part of the contract.
+5. **Hand deploys.** shipd sets `SHIPD_RELEASE=1` for the gates, the build and the deploy. A site's own deploy script refuses to deploy to production
+   without it. This stops the accident, a hand run that builds the working tree; it is an ordinary environment variable and not a lock.
+6. **Commands stop.** Any one command (gate, build, deploy) is stopped after 30 minutes. Each build starts from a clean checkout (`git clean -fdx`).
+7. **No remote.** `remote = "none"` makes the local branch the truth.

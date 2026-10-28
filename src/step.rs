@@ -74,6 +74,7 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
                 );
             }
             // Show goes straight on, unless the diff touches routing or code: those need a person's word, so they wait like Hold.
+            let built = Built::KeptFolder { tree_digest: report.tree_digest.clone() };
             let waits = matches!(plan.diff, DiffPolicy::Hold { .. }) || !report.flagged.is_empty();
             if waits {
                 let words = describe(&S::Diffed { live: live.clone(), candidate: candidate.clone(), report: report.clone() });
@@ -83,8 +84,8 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
                 )
             } else {
                 (
-                    S::Deploying { previous: live, candidate: candidate.clone() },
-                    vec![Effect::Report(Where::Console, report.text), Effect::Deploy(candidate)],
+                    S::Deploying { previous: live, candidate: candidate.clone(), built: built.clone() },
+                    vec![Effect::Report(Where::Console, report.text), Effect::Deploy { commit: candidate, built }],
                 )
             }
         }
@@ -107,8 +108,11 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
             match refusal {
                 Some(why) => say(S::Diffed { live, candidate, report }, format!("not approved: {why}")),
                 None => (
-                    S::Deploying { previous: live, candidate: candidate.clone() },
-                    vec![Effect::Report(Where::Console, format!("approved {} with diff {}", candidate.short(), report.digest.get(..12).unwrap_or(&report.digest))), Effect::Deploy(candidate)],
+                    S::Deploying { previous: live, candidate: candidate.clone(), built: Built::KeptFolder { tree_digest: report.tree_digest.clone() } },
+                    vec![
+                        Effect::Report(Where::Console, format!("approved {} with diff {}", candidate.short(), report.digest.get(..12).unwrap_or(&report.digest))),
+                        Effect::Deploy { commit: candidate, built: Built::KeptFolder { tree_digest: report.tree_digest } },
+                    ],
                 ),
             }
         }
@@ -124,11 +128,11 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
         }
 
         // Deploying: the deploy command's result decides between Verifying and Failed. The tag waits for a verified deploy.
-        (S::Deploying { previous, candidate }, E::Deployed { version }) => {
+        (S::Deploying { previous, candidate, .. }, E::Deployed { version }) => {
             let now = LiveTag { n: plan.highest + 1, commit: candidate.clone() };
             (S::Verifying { previous, now, version }, vec![Effect::VerifyLive])
         }
-        (S::Deploying { previous, candidate }, E::DeployFailed { why }) => {
+        (S::Deploying { previous, candidate, .. }, E::DeployFailed { why }) => {
             let text = format!("deploy of {} failed: {}. Live is still {}", candidate.short(), why, previous.name());
             (S::Failed { live: previous, candidate, why }, vec![Effect::Report(Where::Console, text)])
         }
@@ -207,9 +211,9 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
 
         // Resumed: a state that was killed mid-effect runs that effect again. Deploys are idempotent by commit.
         (S::Gating { live, candidate, .. }, E::Resumed) => start(live, candidate, plan),
-        (S::Deploying { previous, candidate }, E::Resumed) => (
-            S::Deploying { previous: previous.clone(), candidate: candidate.clone() },
-            vec![Effect::Deploy(candidate)],
+        (S::Deploying { previous, candidate, built }, E::Resumed) => (
+            S::Deploying { previous: previous.clone(), candidate: candidate.clone(), built: built.clone() },
+            vec![Effect::Deploy { commit: candidate, built }],
         ),
         (S::Diffing { live, candidate }, E::Resumed) => (
             S::Diffing { live: live.clone(), candidate: candidate.clone() },
@@ -247,7 +251,7 @@ fn start(live: LiveTag, candidate: Commit, plan: &Plan) -> Step {
 /// Every gate has passed: build both sides and compare when the site has a diff step, or deploy.
 fn after_gates(live: LiveTag, candidate: Commit, plan: &Plan) -> Step {
     match plan.diff {
-        DiffPolicy::Off => (ShipState::Deploying { previous: live, candidate: candidate.clone() }, vec![Effect::Deploy(candidate)]),
+        DiffPolicy::Off => (ShipState::Deploying { previous: live, candidate: candidate.clone(), built: Built::BySiteDeploy }, vec![Effect::Deploy { commit: candidate, built: Built::BySiteDeploy }]),
         DiffPolicy::Show { .. } | DiffPolicy::Hold { .. } => {
             (ShipState::Diffing { live: live.clone(), candidate: candidate.clone() }, vec![Effect::MakeDiff { live: live.commit, candidate }])
         }

@@ -102,6 +102,15 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// SHA-256 over every path and fingerprint: names this exact folder. The deploy is held to it.
+    pub fn digest(&self) -> String {
+        let mut h = Sha256::new();
+        for (path, fp) in &self.files {
+            h.update(format!("{}\t{fp}\n", path.as_str()));
+        }
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Reads a folder. A symlink is an error that names it (the diff cannot see through one, so it will not skip one), and so is an empty folder.
     pub fn read(dir: &Path) -> Result<Tree, String> {
         let mut files = BTreeMap::new();
@@ -161,6 +170,8 @@ pub struct Counts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffSummary {
+    /// The digest of the candidate's whole folder, not only of what changed.
+    pub tree_digest: String,
     pub unchanged: usize,
     pub by_kind: Vec<(PathKind, Counts)>,
     pub changed: Vec<ChangedPath>,
@@ -197,7 +208,7 @@ pub fn diff_trees(live: &Tree, candidate: &Tree) -> DiffSummary {
         .filter(|c| c.change == Change::Removed && c.kind == PathKind::Page && !covered(&rules, &c.path, candidate))
         .map(|c| c.path.clone())
         .collect();
-    DiffSummary { unchanged, by_kind: counts.into_iter().collect(), changed, gone_without_redirect }
+    DiffSummary { tree_digest: candidate.digest(), unchanged, by_kind: counts.into_iter().collect(), changed, gone_without_redirect }
 }
 
 /// One line of a `_redirects` file: where from, where to, and the status (301 when the line gives none).
@@ -264,6 +275,8 @@ fn covered(rules: &[Rule], page: &RelPath, candidate: &Tree) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffReport {
     pub text: String,
+    /// The digest of the candidate folder that was built and shown. What deploys must be this folder, byte for byte.
+    pub tree_digest: String,
     /// SHA-256 over every changed path with both fingerprints. The approval carries it, so a different diff cannot be approved by mistake.
     pub digest: String,
     /// Kinds with a change that need a word at approval (routing, code).
@@ -280,7 +293,7 @@ impl DiffSummary {
         }
         let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         let flagged = self.by_kind.iter().filter(|(k, _)| k.needs_word()).map(|(k, _)| *k).collect();
-        DiffReport { text: self.render(max_paths), digest, flagged, gone_without_redirect: self.gone_without_redirect.clone() }
+        DiffReport { text: self.render(max_paths), tree_digest: self.tree_digest.clone(), digest, flagged, gone_without_redirect: self.gone_without_redirect.clone() }
     }
 
     pub fn is_empty(&self) -> bool {
