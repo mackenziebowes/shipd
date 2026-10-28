@@ -22,12 +22,12 @@ Commands:
   status [SITE]               the state of each site, in words, and the dry-run count
   watch [--once] [--dry-run]  check origin for each site; every 60 seconds unless --once
   rollback SITE [--dry-run]   redeploy the previous live/<n> tag
-  mark-live SITE COMMIT       record a commit that a person deployed by hand
+  mark-live SITE COMMIT [--as NAME]
+                              record a commit that a person deployed by hand; with serve_check, only if its build matches the served pages
   release SITE [--commit REV] [--dry-run]
                               run one commit (default: the branch head) through the gates, the diff and the deploy
   approve SITE DIGEST [--allow routing,code]
                               approve the diff that is waiting, by its digest
-  accept-live SITE            after a release was blocked because the served site changed: record the site as it is now
   diff LIVE_DIR NEXT_DIR      say which files differ between two built folders
   digest DIR                  print the SHA-256 that names a built folder (what an approval and a deploy are held to)
 
@@ -66,14 +66,6 @@ fn run(args: &[String]) -> Result<(), String> {
         "mark-live" => mark_live(&config_path, &paths, rest),
         "release" => release(&config_path, &paths, rest),
         "approve" => approve(&config_path, &paths, rest),
-        "accept-live" => {
-            let pos = positional(rest);
-            let [name] = pos.as_slice() else { return Err("usage: shipd accept-live SITE".into()) };
-            let site = sites_named(&config_path, Some(name.as_str()))?.remove(0);
-            let state = driver::accept_live(&Run { site: &site, paths: &paths, dry: false })?;
-            println!("{}: {}", site.name, driver::words(&state));
-            Ok(())
-        }
         "diff" => diff_command(rest),
         "digest" => {
             let pos = positional(rest);
@@ -199,7 +191,14 @@ fn mark_live(config_path: &PathBuf, paths: &Paths, args: &[String]) -> Result<()
         return Err("mark-live needs a site and a commit: shipd mark-live SITE COMMIT".into());
     };
     let site = sites_named(config_path, Some(name))?.remove(0);
-    println!("{}", driver::mark_live(paths, &site, commit)?);
+    let (as_name, _) = take_flag(args, "--as")?;
+    let caller = format!("{} as {}", std::env::var("USER").unwrap_or_else(|_| "unknown user".into()), as_name.as_deref().unwrap_or("(no --as name given)"));
+    // A site that checks the pages it serves must have the named commit proved against them; others keep the dry-run bookkeeping.
+    if site.serve_check.is_empty() {
+        println!("{}", driver::mark_live(paths, &site, commit)?);
+    } else {
+        println!("{}", driver::mark_live_verified(&Run { site: &site, paths, dry: false }, commit, &caller)?);
+    }
     Ok(())
 }
 
@@ -208,10 +207,9 @@ fn help(command: &str) -> String {
         "status" => "shipd status [SITE]\n\nPrints each site's state in words, its last gate failure, and how many dry-run\npushes in a row would have been right.".into(),
         "watch" => "shipd watch [--once] [--dry-run]\n\nFor each site: git fetch origin, send origin's branch head to the state machine, and run what it\nasks for. Gates always run for real. With --dry-run, Deploy, Tag and Redeploy are only printed.\nWithout --once it repeats every 60 seconds.".into(),
         "rollback" => "shipd rollback SITE [--dry-run]\n\nSends a rollback request: the previous live/<n> tag is redeployed, and the failed commit is held\non main until main moves past it.".into(),
-        "mark-live" => "shipd mark-live SITE COMMIT\n\nRecords that a person deployed COMMIT by hand. If shipd would have deployed the same commit in\ndry-run, that is counted as agreed; a different commit is disagreed.".into(),
+        "mark-live" => "shipd mark-live SITE COMMIT [--as NAME]\n\nWith serve_check: builds COMMIT and requires every served page to be what the build holds. Only then is COMMIT the next live/<n>, with the\npages as they are; a commit whose build is not what is served is refused, naming the page. The caller (USER and --as) is recorded.\n\nWithout serve_check: shipd mark-live SITE COMMIT\n\nRecords that a person deployed COMMIT by hand. If shipd would have deployed the same commit in\ndry-run, that is counted as agreed; a different commit is disagreed.".into(),
         "release" => "shipd release SITE [--commit REV] [--dry-run]\n\nSends one commit (REV, which must be on the site's branch; or the branch head) through the same machine as `watch`: the gates in a clean\nworktree, then the diff against live if the site has a [site.diff] section, then the deploy, the live check and the live/<n> tag. With\nmode \"hold\" it stops after the diff and waits for `shipd approve`.".into(),
         "approve" => "shipd approve SITE DIGEST [--allow routing,code]\n\nApproves the diff the site is waiting on. DIGEST is the digest printed with the diff (12 characters are enough). If the diff changes\nrouting or code files, say so with --allow. A different commit, a different digest or a missing word is refused, and nothing deploys.".into(),
-        "accept-live" => "shipd accept-live SITE\n\nFor a person who has looked. A release was blocked because the pages the site serves no longer match what they were when the live tag went\nlive (a hand deploy, or a page that is not static). This records the pages as they are now, drops the blocked release and returns the site to idle.".into(),
         "digest" => "shipd digest DIR\n\nPrints the SHA-256 over every path and file hash of a built folder. An approval and a deploy are held to it.".into(),
         "diff" => "shipd diff LIVE_DIR NEXT_DIR\n\nReads two built folders and says which files were added, removed or changed, by kind (pages, stylesheets,\nscripts, data, images, redirects), then lists the changed paths. Exit 0 whether or not they differ.".into(),
         _ => USAGE.into(),

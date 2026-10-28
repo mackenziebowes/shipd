@@ -51,7 +51,10 @@ output line that starts with `version_line`) and the rollback line.
    shared tree.
 9. **Is the site serving what the tag says?** `serve_check = [urls]` names pages (the home page and the sitemap) whose bodies are fingerprinted (SHA-256)
    after each verified deploy and kept with the `live/<n>` tag. Before the next diff is built they are fetched again; if one differs, the release is
-   blocked at the diff gate, naming the page: someone deployed by hand, or the page is not static. A person who has looked runs `shipd accept-live
-   SITE`, which records the pages as they are now and returns the site to idle. A tag that went live before the site had `serve_check` has no
-   fingerprint, so its first release is not checked.
+   blocked at the diff gate, naming the page: someone deployed by hand, or the page is not static. If a commit was deployed by hand, `shipd mark-live SITE COMMIT --as NAME` builds it
+   and requires every `serve_check` page to be what the build holds, byte for byte; only then does it become the next `live/<n>` with the pages as they
+   are, so the diff base is true again. A commit whose build is not what is served is refused. (There is no command that records "the site is fine as
+   it is" without naming the commit: that would hide the hand deploy.) The caller is recorded. The pages are read twice, 5 seconds apart, and must
+   agree, so a cache that is still catching up is not recorded. A tag that went live before the site had `serve_check` has no fingerprint, so its first
+   release is not checked. Checking `/` and `/sitemap.xml` catches pages added or removed, not an edited inner page: list more pages to catch those.
 10. **No remote.** `remote = "none"` makes the local branch the truth.

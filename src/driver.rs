@@ -210,6 +210,19 @@ fn land(run: &Run, tag: &LiveTag) -> Option<Commit> {
     }
 }
 
+/// Fingerprints the pages twice, 5 seconds apart, and requires the same answer both times: an edge cache that still holds the old body right after a
+/// deploy would otherwise be recorded as what the new tag serves, and later block a clean release.
+fn fingerprint_stable(urls: &[String]) -> Result<Vec<UrlPrint>, String> {
+    let first = fingerprint(urls)?;
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let second = fingerprint(urls)?;
+    if first == second {
+        Ok(second)
+    } else {
+        Err("the pages changed between two reads 5 seconds apart (a cache is still catching up)".into())
+    }
+}
+
 /// The SHA-256 of the body each page answers with right now.
 fn fingerprint(urls: &[String]) -> Result<Vec<UrlPrint>, String> {
     urls.iter()
@@ -318,7 +331,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 return Ok(vec![]);
             }
             Ok(vec![ShipEvent::ServedRecorded {
-                served: match fingerprint(&site.serve_check) {
+                served: match fingerprint_stable(&site.serve_check) {
                     Ok(urls) => Served::Prints { urls },
                     Err(why) => {
                         say(format!("the served pages were not fingerprinted ({why}); a hand deploy will not be noticed until the next release records them"));
@@ -335,7 +348,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                     Ok(now) if now == *urls => {}
                     Ok(now) => {
                         let changed: Vec<&str> = now.iter().zip(urls).filter(|(a, b)| a != b).map(|(a, _)| a.url.as_str()).collect();
-                        return Ok(vec![ShipEvent::DiffFailed { why: format!("live is not {}: {} answers differently from when {} went live. Someone deployed by hand, or the page is not static. Find out which. When the site is as it should be, run `shipd accept-live SITE` to record the pages as they are now, then release again.", live.name(), changed.join(", "), live.name()) }]);
+                        return Ok(vec![ShipEvent::DiffFailed { why: format!("live is not {}: {} answers differently from when {} went live. Someone deployed by hand, or the page is not static. Find out which. If a commit was deployed by hand, `shipd mark-live SITE <commit> --as <your name>` proves it against the served pages and makes it the live tag. Otherwise redeploy the live tag.", live.name(), changed.join(", "), live.name()) }]);
                     }
                     Err(why) => return Ok(vec![ShipEvent::DiffFailed { why: format!("the served pages could not be fetched to check them against {}: {why}", live.name()) }]),
                 }
@@ -577,27 +590,6 @@ pub fn approve_site(run: &Run, digest: &str, allow: Vec<crate::diff::PathKind>) 
     result
 }
 
-/// A person has looked and says the site being served is what it should be: its pages are fingerprinted as they are now and kept with the live tag, and a
-/// release that was blocked because they differed is dropped, so the next release starts afresh. Only from a block on the diff gate.
-pub fn accept_live(run: &Run) -> Result<ShipState, String> {
-    let state = store::load_state(run.paths, &run.site.name)?.ok_or_else(|| format!("{} has no state yet.", run.site.name))?;
-    let ShipState::Blocked { live, failed, .. } = &state else {
-        return Err(format!("accept-live only follows a release blocked at the diff gate. {} is: {}", run.site.name, words(&state)));
-    };
-    if failed.as_str() != "diff" {
-        return Err(format!("{} is blocked at the {} gate, not the diff gate; accept-live does not help here", run.site.name, failed.as_str()));
-    }
-    if run.site.serve_check.is_empty() {
-        return Err(format!("{} has no serve_check pages to record", run.site.name));
-    }
-    let served = Served::Prints { urls: fingerprint(&run.site.serve_check)? };
-    let live = LiveTag { served, ..live.clone() };
-    let next = ShipState::Idle { live: live.clone(), previous: live };
-    store::save_state(run.paths, &run.site.name, &next)?;
-    store::append(run.paths, &run.site.name, "accept_live", json!({ "by": "a person" }))?;
-    Ok(next)
-}
-
 /// Sends a rollback request through the machine, the same way a watch pass does.
 pub fn rollback_site(run: &Run) -> Result<ShipState, String> {
     let state = store::load_state(run.paths, &run.site.name)?
@@ -613,6 +605,56 @@ pub fn mark_live(paths: &Paths, site: &Site, text: &str) -> Result<String, Strin
     store::append(paths, &site.name, "human_deployed", json!({ "commit": commit.as_str() }))?;
     resolve_with(paths, site)?;
     Ok(format!("recorded: {} was deployed by hand on {}", commit.short(), site.name))
+}
+
+/// The file a static host serves at this URL's path.
+fn file_for(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path.split_once("://").map(|(_, rest)| rest.split_once('/').map(|(_, p)| p).unwrap_or("")).unwrap_or(path).trim_start_matches('/');
+    if path.is_empty() || path.ends_with('/') { format!("{path}index.html") } else { path.to_string() }
+}
+
+/// A person says which commit is actually being served (after a hand deploy, say). shipd builds that commit and requires every `serve_check` page to
+/// be what the build holds, byte for byte. Only then does that commit become the next live tag, with the pages as they are, so the diff base is true
+/// again. A commit whose build is not what is served is refused, naming the page. `caller` is who ran it, recorded as given.
+pub fn mark_live_verified(run: &Run, text: &str, caller: &str) -> Result<String, String> {
+    let site = run.site;
+    let (DiffPolicy::Show { build, .. } | DiffPolicy::Hold { build, .. }) = &site.diff else {
+        return Err("this site has no [site.diff] build, so there is nothing to check the served pages against".into());
+    };
+    let commit = Commit::parse(&git(&site.repo, &["rev-parse", "--verify", &format!("{text}^{{commit}}")])?)?;
+    let state = store::load_state(run.paths, &site.name)?.ok_or_else(|| format!("{} has no state yet.", site.name))?;
+    let live = match &state {
+        ShipState::Idle { live, .. } | ShipState::Blocked { live, .. } | ShipState::Failed { live, .. } | ShipState::Held { live, .. } => live.clone(),
+        other => return Err(format!("{} is not at rest ({}); mark-live waits until it is", site.name, words(other))),
+    };
+    let out = run.paths.site_dir(&site.name).join("diff-live");
+    let result = (|| {
+        build_into(run, build, &commit, &out)?;
+        let tree = crate::diff::Tree::read(&out)?;
+        let served = fingerprint_stable(&site.serve_check)?;
+        for print in &served {
+            let file = file_for(&print.url);
+            match tree.file_hash(&file) {
+                Some(h) if h == print.sha256 => {}
+                Some(_) => return Err(format!("{} does not match the commit's build ({file}): {} serves something else. Name the commit that was deployed, or redeploy {}.", print.url, print.url, live.name())),
+                None => return Err(format!("{} is served, but the commit's build has no {file}. Name the commit that was deployed, or redeploy {}.", print.url, live.name())),
+            }
+        }
+        Ok(served)
+    })();
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_file(run.paths.site_dir(&site.name).join("diff-live.urls.txt"));
+    clean_work(run);
+    let served = result?;
+    let n = highest_tag_in_git(site)?.max(state.highest_number()) + 1;
+    let tag = LiveTag { n, commit: commit.clone(), served: Served::Prints { urls: served } };
+    git(&site.repo, &["tag", &tag.name(), commit.as_str()])?;
+    let next = ShipState::Idle { live: tag.clone(), previous: live.clone() };
+    store::save_state(run.paths, &site.name, &next)?;
+    store::append(run.paths, &site.name, "human_deployed", json!({ "commit": commit.as_str(), "tag": tag.name(), "by": caller, "verified_against_served": true }))?;
+    resolve_with(run.paths, site)?;
+    Ok(format!("{} is now {} (its build matches the {} served page(s)); the diff base is true again. Recorded by {caller}.", commit.short(), tag.name(), site.serve_check.len()))
 }
 
 fn resolve(run: &Run) -> Result<(), String> {

@@ -107,6 +107,11 @@ pub struct Tree {
 }
 
 impl Tree {
+    /// The SHA-256 of one file's bytes, by its place in the folder (`index.html`, `a/b/index.html`).
+    pub fn file_hash(&self, path: &str) -> Option<&str> {
+        self.files.get(&RelPath(path.to_string())).map(String::as_str)
+    }
+
     /// SHA-256 over every path and fingerprint: names this exact folder. The deploy is held to it.
     pub fn digest(&self) -> String {
         let mut h = Sha256::new();
