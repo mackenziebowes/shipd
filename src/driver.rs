@@ -638,7 +638,7 @@ pub fn mark_live_verified(run: &Run, text: &str, caller: &str) -> Result<String,
             match tree.file_hash(&file) {
                 Some(h) if h == print.sha256 => {}
                 Some(_) => return Err(format!("{} does not match the commit's build ({file}): {} serves something else. Name the commit that was deployed, or redeploy {}.", print.url, print.url, live.name())),
-                None => return Err(format!("{} is served, but the commit's build has no {file}. Name the commit that was deployed, or redeploy {}.", print.url, live.name())),
+                None => return Err(format!("{} is served, but the commit's build has no {file}. If the URL has no file extension and does not end in /, list a serve_check URL that is a file or ends in / (the host may serve it from another file). Otherwise name the commit that was deployed, or redeploy {}.", print.url, live.name())),
             }
         }
         Ok(served)
