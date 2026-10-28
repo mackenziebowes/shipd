@@ -191,30 +191,73 @@ pub fn diff_trees(live: &Tree, candidate: &Tree) -> DiffSummary {
             Change::Changed => n.changed += 1,
         }
     }
-    let sources = redirect_sources(&candidate.redirects);
+    let rules = redirect_rules(&candidate.redirects);
     let gone_without_redirect = changed
         .iter()
-        .filter(|c| c.change == Change::Removed && c.kind == PathKind::Page && !covered(&sources, &c.path))
+        .filter(|c| c.change == Change::Removed && c.kind == PathKind::Page && !covered(&rules, &c.path, candidate))
         .map(|c| c.path.clone())
         .collect();
     DiffSummary { unchanged, by_kind: counts.into_iter().collect(), changed, gone_without_redirect }
 }
 
-/// The "from" side of each rule in a `_redirects` file: the first word of each line that is not blank or a comment.
-fn redirect_sources(text: &str) -> Vec<String> {
-    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|l| l.split_whitespace().next()).map(String::from).collect()
+/// One line of a `_redirects` file: where from, where to, and the status (301 when the line gives none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Rule {
+    from: String,
+    to: String,
+    status: u16,
 }
 
-/// Whether some redirect rule answers for the address a removed page used to have. `a/b/index.html` was served at `/a/b/`, `/a/b` and
-/// `/a/b/index.html`; a rule ending in `*` covers every address that starts with what comes before it.
-fn covered(sources: &[String], page: &RelPath) -> bool {
+/// The rules in a `_redirects` file that really redirect: a 3xx status, and a target that is not the address it redirects from.
+/// A 200 rule is a rewrite (it serves a page at the old address and hides that the page is gone), and 404 or 410 says it is gone.
+fn redirect_rules(text: &str) -> Vec<Rule> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let (from, to) = (words.next()?, words.next()?);
+            let status = words.next().and_then(|w| w.trim_end_matches('!').parse::<u16>().ok()).unwrap_or(301);
+            ((300..400).contains(&status) && from != to).then(|| Rule { from: from.into(), to: to.into(), status })
+        })
+        .collect()
+}
+
+/// Whether an address matches a rule's "from": `*` at the end takes the rest, `:name` takes one segment, anything else must be equal.
+fn matches_from(pattern: &str, address: &str) -> bool {
+    let (pat, addr): (Vec<&str>, Vec<&str>) = (pattern.trim_matches('/').split('/').collect(), address.trim_matches('/').split('/').collect());
+    for (i, seg) in pat.iter().enumerate() {
+        if *seg == "*" && i == pat.len() - 1 {
+            return addr.len() >= i;
+        }
+        match addr.get(i) {
+            None => return false,
+            Some(a) if seg.starts_with(':') && !a.is_empty() => {}
+            Some(a) if a == seg => {}
+            Some(_) => return false,
+        }
+    }
+    pat.len() == addr.len()
+}
+
+/// Whether the candidate has something at the rule's target: an absolute URL, a placeholder or splat target (not checkable), or a page or file.
+fn target_exists(target: &str, candidate: &Tree) -> bool {
+    if target.starts_with("http://") || target.starts_with("https://") || target.contains(':') || target.contains('*') {
+        return true;
+    }
+    let path = target.split(['?', '#']).next().unwrap_or(target).trim_start_matches('/');
+    let dir = path.trim_end_matches('/');
+    let has = |p: String| candidate.files.contains_key(&RelPath(p));
+    dir.is_empty() && has("index.html".into()) || has(dir.to_string()) || has(format!("{dir}/index.html")) || has(format!("{dir}.html"))
+}
+
+/// Whether some redirect answers for the address a removed page used to have, and sends it somewhere that exists. `a/b/index.html` was served at
+/// `/a/b/`, `/a/b` and `/a/b/index.html`.
+fn covered(rules: &[Rule], page: &RelPath, candidate: &Tree) -> bool {
     let p = page.as_str();
     let dir = p.strip_suffix("index.html").unwrap_or(p).trim_end_matches('/');
     let addresses = [format!("/{dir}/"), format!("/{dir}"), format!("/{p}")];
-    sources.iter().any(|s| match s.strip_suffix('*') {
-        Some(prefix) => addresses.iter().any(|a| a.starts_with(prefix)),
-        None => addresses.iter().any(|a| a == s),
-    })
+    rules.iter().any(|r| r.status >= 300 && addresses.iter().any(|a| matches_from(&r.from, a)) && target_exists(&r.to, candidate))
 }
 
 /// What the release step and the person approving both need: words, a digest that names this exact diff, and what must be said out loud.
@@ -249,13 +292,13 @@ impl DiffSummary {
         if self.is_empty() {
             return format!("nothing changed: all {} files are identical to live\n", self.unchanged);
         }
-        let mut out = format!("{} files changed, {} unchanged\n", self.changed.len(), self.unchanged);
+        let mut out = format!("{} files changed, {} unchanged (the build of the commit tagged live/N against the build of the candidate, not against the site being served)\n", self.changed.len(), self.unchanged);
         for (kind, n) in &self.by_kind {
             let flag = if kind.needs_word() { "  <- needs a word at approval" } else { "" };
             out.push_str(&format!("  {}: {} added, {} removed, {} changed{flag}\n", kind.plural(), n.added, n.removed, n.changed));
         }
         if !self.gone_without_redirect.is_empty() {
-            out.push_str(&format!("  {} removed pages have no redirect:\n", self.gone_without_redirect.len()));
+            out.push_str(&format!("  {} removed pages have no redirect to a page that exists:\n", self.gone_without_redirect.len()));
             for p in self.gone_without_redirect.iter().take(10) {
                 out.push_str(&format!("    {}\n", p.as_str()));
             }
