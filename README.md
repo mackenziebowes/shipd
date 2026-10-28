@@ -49,4 +49,9 @@ output line that starts with `version_line`) and the rollback line.
    shipd commits them by path (only for a local branch that is checked out in the repo), tags the landed commit as `live/<n>`, and treats it as live, so
    it is not released again. If it cannot, it says `NOT LANDED` and where the files are. A hand run of the site's deploy script still writes into the
    shared tree.
-9. **No remote.** `remote = "none"` makes the local branch the truth.
+9. **Is the site serving what the tag says?** `serve_check = [urls]` names pages (the home page and the sitemap) whose bodies are fingerprinted (SHA-256)
+   after each verified deploy and kept with the `live/<n>` tag. Before the next diff is built they are fetched again; if one differs, the release is
+   blocked at the diff gate, naming the page: someone deployed by hand, or the page is not static. A person who has looked runs `shipd accept-live
+   SITE`, which records the pages as they are now and returns the site to idle. A tag that went live before the site had `serve_check` has no
+   fingerprint, so its first release is not checked.
+10. **No remote.** `remote = "none"` makes the local branch the truth.

@@ -40,6 +40,7 @@ mode = "dry-run"
 deploy = ["bun", "deploy.ts", "production"]
 version_line = "Current Version ID:"
 land = ["data/published-urls.txt"]
+serve_check = ["https://okanaganregister.com/", "https://okanaganregister.com/sitemap.xml"]
 
 [[site.gates]]
 name = "tests"

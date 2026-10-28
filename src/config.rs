@@ -24,6 +24,8 @@ struct RawSite {
     install: Option<Vec<String>>,
     /// Files the release produces in its checkout that belong on the branch, committed by path after a verified deploy (only when the branch is local).
     land: Option<Vec<String>>,
+    /// Pages to fingerprint after each verified deploy; before the next release they must still look the same, or someone deployed by hand.
+    serve_check: Option<Vec<String>>,
     /// Seconds one command may run before it is stopped. 1800 when left out.
     command_limit_seconds: Option<u64>,
     diff: Option<RawDiff>,
@@ -124,6 +126,7 @@ fn site(s: &RawSite) -> Result<Site, String> {
         diff,
         install: s.install.clone().unwrap_or_default(),
         land: s.land.clone().unwrap_or_default(),
+        serve_check: s.serve_check.clone().unwrap_or_default(),
         command_limit: std::time::Duration::from_secs(match s.command_limit_seconds {
             None => 1800,
             Some(0) => return Err(format!("site \"{}\": command_limit_seconds is 0; give a number of seconds above 0", s.name)),

@@ -31,6 +31,26 @@ impl Commit {
 pub struct LiveTag {
     pub n: u32,
     pub commit: Commit,
+    /// What the live site's check pages looked like when this tag went live, to notice a hand deploy later.
+    #[serde(default)]
+    pub served: Served,
+}
+
+/// A fingerprint of the pages a site serves, taken right after a verified deploy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "served", rename_all = "snake_case")]
+pub enum Served {
+    /// Nothing was recorded: the site has no `serve_check`, or this tag predates it, or a page could not be fetched.
+    #[default]
+    NotRecorded,
+    Prints { urls: Vec<UrlPrint> },
+}
+
+/// The SHA-256 of the body one page answered with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UrlPrint {
+    pub url: String,
+    pub sha256: String,
 }
 
 impl LiveTag {
@@ -136,6 +156,8 @@ pub enum ShipEvent {
     Deployed { version: VersionId },
     /// The files a release produced were committed on the branch: this commit is the branch head, and the live tag names it, so it is not a new candidate.
     Landed { commit: Commit },
+    /// The fingerprints of the pages the site serves now that the new tag is verified.
+    ServedRecorded { served: Served },
     DeployFailed { why: String },
     Verified,
     VerifyFailed { why: String },
@@ -150,7 +172,9 @@ pub enum ShipEvent {
 pub enum Effect {
     FetchWorktree(Commit),
     /// Build `live` and `candidate` into two folders and compare them.
-    MakeDiff { live: Commit, candidate: Commit },
+    MakeDiff { live: LiveTag, candidate: Commit },
+    /// Fetch the pages named by `serve_check` and keep their fingerprints with the tag that just went live.
+    RecordServed,
     RunGate(Gate),
     Deploy { commit: Commit, built: Built },
     Tag(LiveTag),
@@ -239,6 +263,8 @@ pub struct Site {
     pub install: Vec<String>,
     /// Files a release produces in its checkout that belong on the branch (for example a list of published addresses): committed by path after a verified deploy.
     pub land: Vec<String>,
+    /// Pages (absolute URLs) whose bodies are fingerprinted after each verified deploy and compared before the next diff. Empty: no check.
+    pub serve_check: Vec<String>,
     /// The longest any one command of this site may run.
     pub command_limit: std::time::Duration,
     pub verify: Vec<Check>,

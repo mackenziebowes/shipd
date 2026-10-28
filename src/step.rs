@@ -122,7 +122,8 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
         }
 
         // Landed: the release committed its own output on the branch. That commit is live, not a new candidate.
-        (S::Idle { live, previous }, E::Landed { commit }) => (S::Idle { live: LiveTag { n: live.n, commit }, previous }, vec![]),
+        (S::Idle { live, previous }, E::ServedRecorded { served }) => (S::Idle { live: LiveTag { served, ..live }, previous }, vec![]),
+        (S::Idle { live, previous }, E::Landed { commit }) => (S::Idle { live: LiveTag { n: live.n, commit, served: live.served.clone() }, previous }, vec![]),
 
         // Blocked: nothing deploys until origin moves to a newer commit. The same candidate changes nothing.
         (S::Blocked { live, candidate, failed, report }, E::OriginMoved { commit }) => {
@@ -132,7 +133,7 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
 
         // Deploying: the deploy command's result decides between Verifying and Failed. The tag waits for a verified deploy.
         (S::Deploying { previous, candidate, .. }, E::Deployed { version }) => {
-            let now = LiveTag { n: plan.highest + 1, commit: candidate.clone() };
+            let now = LiveTag { n: plan.highest + 1, commit: candidate.clone(), served: Served::NotRecorded };
             (S::Verifying { previous, now, version }, vec![Effect::VerifyLive])
         }
         (S::Deploying { previous, candidate, .. }, E::DeployFailed { why }) => {
@@ -157,7 +158,7 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
             );
             (
                 S::Idle { live: now.clone(), previous },
-                vec![Effect::Tag(now), Effect::Report(Where::Console, text)],
+                vec![Effect::Tag(now), Effect::RecordServed, Effect::Report(Where::Console, text)],
             )
         }
         (S::Verifying { previous, now, .. }, E::VerifyFailed { why }) => {
@@ -220,7 +221,7 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
         ),
         (S::Diffing { live, candidate }, E::Resumed) => (
             S::Diffing { live: live.clone(), candidate: candidate.clone() },
-            vec![Effect::MakeDiff { live: live.commit, candidate }],
+            vec![Effect::MakeDiff { live: live.clone(), candidate }],
         ),
         (S::Verifying { previous, now, version }, E::Resumed) => (S::Verifying { previous, now, version }, vec![Effect::VerifyLive]),
         (S::RollingBack { failed, to, why }, E::Resumed) => (
@@ -256,7 +257,7 @@ fn after_gates(live: LiveTag, candidate: Commit, plan: &Plan) -> Step {
     match plan.diff {
         DiffPolicy::Off => (ShipState::Deploying { previous: live, candidate: candidate.clone(), built: Built::BySiteDeploy }, vec![Effect::Deploy { commit: candidate, built: Built::BySiteDeploy }]),
         DiffPolicy::Show { .. } | DiffPolicy::Hold { .. } => {
-            (ShipState::Diffing { live: live.clone(), candidate: candidate.clone() }, vec![Effect::MakeDiff { live: live.commit, candidate }])
+            (ShipState::Diffing { live: live.clone(), candidate: candidate.clone() }, vec![Effect::MakeDiff { live: live.clone(), candidate }])
         }
     }
 }
@@ -289,6 +290,7 @@ fn event_name(event: &ShipEvent) -> &'static str {
         ShipEvent::DiffMade { .. } | ShipEvent::DiffFailed { .. } => "a diff result",
         ShipEvent::Approved { .. } => "an approval",
         ShipEvent::Landed { .. } => "a landed commit",
+        ShipEvent::ServedRecorded { .. } => "a recorded fingerprint",
         ShipEvent::Deployed { .. } | ShipEvent::DeployFailed { .. } => "a deploy result",
         ShipEvent::Verified | ShipEvent::VerifyFailed { .. } => "a live check result",
         ShipEvent::RollbackRequested => "a rollback request",

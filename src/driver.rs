@@ -210,6 +210,20 @@ fn land(run: &Run, tag: &LiveTag) -> Option<Commit> {
     }
 }
 
+/// The SHA-256 of the body each page answers with right now.
+fn fingerprint(urls: &[String]) -> Result<Vec<UrlPrint>, String> {
+    urls.iter()
+        .map(|url| {
+            let out = Command::new("curl").args(["-sS", "-L", "--max-time", "20", "--fail", url]).output().map_err(|e| format!("cannot run curl: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            let sha256: String = sha2::Digest::finalize(sha2::Digest::chain_update(sha2::Sha256::default(), &out.stdout)).iter().map(|b| format!("{b:02x}")).collect();
+            Ok(UrlPrint { url: url.clone(), sha256 })
+        })
+        .collect()
+}
+
 /// The site's install step, run in a fresh checkout. Nothing when the site has none.
 fn install(run: &Run, work: &Path) -> Result<(), String> {
     if run.site.install.is_empty() {
@@ -279,7 +293,8 @@ pub fn settle(run: &Run, state: ShipState, events: Vec<ShipEvent>) -> Result<Shi
 fn effect_words(effect: &Effect) -> String {
     match effect {
         Effect::FetchWorktree(c) => format!("fetch a worktree at {}", c.short()),
-        Effect::MakeDiff { live, candidate } => format!("build {} and {} and compare them", live.short(), candidate.short()),
+        Effect::MakeDiff { live, candidate } => format!("build {} and {} and compare them", live.commit.short(), candidate.short()),
+        Effect::RecordServed => "fingerprint the pages the site serves".into(),
         Effect::RunGate(g) => format!("run gate \"{}\"", g.name.as_str()),
         Effect::Deploy { commit, .. } => format!("deploy {}", commit.short()),
         Effect::Tag(t) => format!("tag {}", t.name()),
@@ -298,7 +313,34 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             ensure_work(run, &commit)?;
             Ok(vec![])
         }
+        Effect::RecordServed => {
+            if run.dry || site.serve_check.is_empty() {
+                return Ok(vec![]);
+            }
+            Ok(vec![ShipEvent::ServedRecorded {
+                served: match fingerprint(&site.serve_check) {
+                    Ok(urls) => Served::Prints { urls },
+                    Err(why) => {
+                        say(format!("the served pages were not fingerprinted ({why}); a hand deploy will not be noticed until the next release records them"));
+                        Served::NotRecorded
+                    }
+                },
+            }])
+        }
         Effect::MakeDiff { live, candidate } => {
+            // Before building anything: is the site serving what the live tag says it is? A hand deploy since then makes any diff describe a site that is gone.
+            if let Served::Prints { urls } = &live.served {
+                let now = fingerprint(&urls.iter().map(|u| u.url.clone()).collect::<Vec<_>>());
+                match now {
+                    Ok(now) if now == *urls => {}
+                    Ok(now) => {
+                        let changed: Vec<&str> = now.iter().zip(urls).filter(|(a, b)| a != b).map(|(a, _)| a.url.as_str()).collect();
+                        return Ok(vec![ShipEvent::DiffFailed { why: format!("live is not {}: {} answers differently from when {} went live. Someone deployed by hand, or the page is not static. Find out which. When the site is as it should be, run `shipd accept-live SITE` to record the pages as they are now, then release again.", live.name(), changed.join(", "), live.name()) }]);
+                    }
+                    Err(why) => return Ok(vec![ShipEvent::DiffFailed { why: format!("the served pages could not be fetched to check them against {}: {why}", live.name()) }]),
+                }
+            }
+            let live = live.commit;
             let (DiffPolicy::Show { build, deploy_files } | DiffPolicy::Hold { build, deploy_files }) = &site.diff else {
                 return Ok(vec![ShipEvent::DiffFailed { why: "the site has no [site.diff] section but a diff was asked for".into() }]);
             };
@@ -447,12 +489,12 @@ pub fn initial_state(site: &Site, head: &Commit) -> Result<ShipState, String> {
     for name in names.lines().filter(|l| !l.is_empty()) {
         let Some(n) = name.strip_prefix("live/").and_then(|x| x.parse::<u32>().ok()) else { continue };
         let commit = Commit::parse(&git(&site.repo, &["rev-parse", &format!("{name}^{{commit}}")])?)?;
-        tags.push(LiveTag { n, commit });
+        tags.push(LiveTag { n, commit, served: Served::NotRecorded });
     }
     tags.sort_by_key(|t| t.n);
     Ok(match tags.len() {
         0 => {
-            let live = LiveTag { n: 0, commit: head.clone() };
+            let live = LiveTag { n: 0, commit: head.clone(), served: Served::NotRecorded };
             ShipState::Idle { live: live.clone(), previous: live }
         }
         1 => {
@@ -533,6 +575,27 @@ pub fn approve_site(run: &Run, digest: &str, allow: Vec<crate::diff::PathKind>) 
     let result = settle(run, state, vec![ShipEvent::Approved { commit, digest: digest.to_string(), allow }]);
     clean_work(run);
     result
+}
+
+/// A person has looked and says the site being served is what it should be: its pages are fingerprinted as they are now and kept with the live tag, and a
+/// release that was blocked because they differed is dropped, so the next release starts afresh. Only from a block on the diff gate.
+pub fn accept_live(run: &Run) -> Result<ShipState, String> {
+    let state = store::load_state(run.paths, &run.site.name)?.ok_or_else(|| format!("{} has no state yet.", run.site.name))?;
+    let ShipState::Blocked { live, failed, .. } = &state else {
+        return Err(format!("accept-live only follows a release blocked at the diff gate. {} is: {}", run.site.name, words(&state)));
+    };
+    if failed.as_str() != "diff" {
+        return Err(format!("{} is blocked at the {} gate, not the diff gate; accept-live does not help here", run.site.name, failed.as_str()));
+    }
+    if run.site.serve_check.is_empty() {
+        return Err(format!("{} has no serve_check pages to record", run.site.name));
+    }
+    let served = Served::Prints { urls: fingerprint(&run.site.serve_check)? };
+    let live = LiveTag { served, ..live.clone() };
+    let next = ShipState::Idle { live: live.clone(), previous: live };
+    store::save_state(run.paths, &run.site.name, &next)?;
+    store::append(run.paths, &run.site.name, "accept_live", json!({ "by": "a person" }))?;
+    Ok(next)
 }
 
 /// Sends a rollback request through the machine, the same way a watch pass does.

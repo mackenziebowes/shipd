@@ -27,6 +27,7 @@ Commands:
                               run one commit (default: the branch head) through the gates, the diff and the deploy
   approve SITE DIGEST [--allow routing,code]
                               approve the diff that is waiting, by its digest
+  accept-live SITE            after a release was blocked because the served site changed: record the site as it is now
   diff LIVE_DIR NEXT_DIR      say which files differ between two built folders
   digest DIR                  print the SHA-256 that names a built folder (what an approval and a deploy are held to)
 
@@ -65,6 +66,14 @@ fn run(args: &[String]) -> Result<(), String> {
         "mark-live" => mark_live(&config_path, &paths, rest),
         "release" => release(&config_path, &paths, rest),
         "approve" => approve(&config_path, &paths, rest),
+        "accept-live" => {
+            let pos = positional(rest);
+            let [name] = pos.as_slice() else { return Err("usage: shipd accept-live SITE".into()) };
+            let site = sites_named(&config_path, Some(name.as_str()))?.remove(0);
+            let state = driver::accept_live(&Run { site: &site, paths: &paths, dry: false })?;
+            println!("{}: {}", site.name, driver::words(&state));
+            Ok(())
+        }
         "diff" => diff_command(rest),
         "digest" => {
             let pos = positional(rest);
@@ -202,6 +211,7 @@ fn help(command: &str) -> String {
         "mark-live" => "shipd mark-live SITE COMMIT\n\nRecords that a person deployed COMMIT by hand. If shipd would have deployed the same commit in\ndry-run, that is counted as agreed; a different commit is disagreed.".into(),
         "release" => "shipd release SITE [--commit REV] [--dry-run]\n\nSends one commit (REV, which must be on the site's branch; or the branch head) through the same machine as `watch`: the gates in a clean\nworktree, then the diff against live if the site has a [site.diff] section, then the deploy, the live check and the live/<n> tag. With\nmode \"hold\" it stops after the diff and waits for `shipd approve`.".into(),
         "approve" => "shipd approve SITE DIGEST [--allow routing,code]\n\nApproves the diff the site is waiting on. DIGEST is the digest printed with the diff (12 characters are enough). If the diff changes\nrouting or code files, say so with --allow. A different commit, a different digest or a missing word is refused, and nothing deploys.".into(),
+        "accept-live" => "shipd accept-live SITE\n\nFor a person who has looked. A release was blocked because the pages the site serves no longer match what they were when the live tag went\nlive (a hand deploy, or a page that is not static). This records the pages as they are now, drops the blocked release and returns the site to idle.".into(),
         "digest" => "shipd digest DIR\n\nPrints the SHA-256 over every path and file hash of a built folder. An approval and a deploy are held to it.".into(),
         "diff" => "shipd diff LIVE_DIR NEXT_DIR\n\nReads two built folders and says which files were added, removed or changed, by kind (pages, stylesheets,\nscripts, data, images, redirects), then lists the changed paths. Exit 0 whether or not they differ.".into(),
         _ => USAGE.into(),
