@@ -31,11 +31,17 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Runs a command in `dir`, with SHIPD_TARGET set to the site's shared build directory. Returns success and the output.
-fn run_in(cmd: &[String], dir: &Path, target: &Path) -> (bool, String) {
+fn run_in(cmd: &[String], dir: &Path, target: &Path, out: Option<&Path>) -> (bool, String) {
     let Some((prog, rest)) = cmd.split_first() else {
         return (false, "the command is empty".into());
     };
-    match Command::new(prog).args(rest).current_dir(dir).env("SHIPD_TARGET", target).output() {
+    // SHIPD_RELEASE tells a site's own deploy script that shipd is running it: a deploy script refuses to run without it.
+    let mut command = Command::new(prog);
+    command.args(rest).current_dir(dir).env("SHIPD_TARGET", target).env("SHIPD_RELEASE", "1");
+    if let Some(out) = out {
+        command.env("SHIPD_OUT", out);
+    }
+    match command.output() {
         Ok(out) => {
             let mut text = String::from_utf8_lossy(&out.stdout).to_string();
             text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -63,6 +69,50 @@ fn ensure_work(run: &Run, commit: &Commit) -> Result<PathBuf, String> {
     Ok(work)
 }
 
+/// Builds `commit` with the site's build command into `out` (emptied first), in the site's clean worktree.
+fn build_into(run: &Run, build: &[String], commit: &Commit, out: &Path) -> Result<(), String> {
+    let work = ensure_work(run, commit)?;
+    let _ = std::fs::remove_dir_all(out);
+    std::fs::create_dir_all(out).map_err(|e| format!("cannot make {}: {e}", out.display()))?;
+    let (ok, text) = run_in(build, &work, &run.paths.target(&run.site.name), Some(out));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("the build of {} failed: {}", commit.short(), tail(&text, 20)))
+    }
+}
+
+/// Builds the live commit and the candidate into two folders beside the worktree (never in /tmp), compares them, and removes both.
+fn make_diff(run: &Run, build: &[String], live: &Commit, candidate: &Commit) -> Result<crate::diff::DiffReport, String> {
+    let dir = run.paths.site_dir(&run.site.name);
+    let (live_out, next_out) = (dir.join("diff-live"), dir.join("diff-next"));
+    let result = (|| {
+        build_into(run, build, live, &live_out)?;
+        build_into(run, build, candidate, &next_out)?;
+        let summary = crate::diff::diff_trees(&crate::diff::Tree::read(&live_out)?, &crate::diff::Tree::read(&next_out)?);
+        Ok(summary.report(40))
+    })();
+    let _ = std::fs::remove_dir_all(&live_out);
+    let _ = std::fs::remove_dir_all(&next_out);
+    // a builder may leave a file beside its output folder (generate.ts writes <out>.urls.txt); nothing of the diff stays behind
+    for name in ["diff-live.urls.txt", "diff-next.urls.txt"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    result
+}
+
+/// The platform's version id from the deploy output: what follows the site's prefix on the first line that starts with it.
+fn version_in(source: &VersionSource, output: &str) -> VersionId {
+    let VersionSource::DeployLine { prefix } = source else { return VersionId::NotReported };
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| VersionId::Found(id.to_string()))
+        .unwrap_or(VersionId::NotReported)
+}
+
 /// Removes the site's worktree, so nothing is left behind after a pass.
 pub fn clean_work(run: &Run) {
     let work = run.paths.work(&run.site.name);
@@ -72,6 +122,19 @@ pub fn clean_work(run: &Run) {
         let _ = std::fs::remove_dir_all(&work);
         let _ = git(&run.site.repo, &["worktree", "prune"]);
     }
+}
+
+/// Brings the site's branch up to date when it lives on a remote, and names the ref that is its head.
+fn branch_head(site: &Site) -> Result<(String, Commit), String> {
+    let reference = match &site.source {
+        BranchSource::Remote { name } => {
+            git(&site.repo, &["fetch", name])?;
+            format!("{name}/{}", site.branch)
+        }
+        BranchSource::Local => site.branch.clone(),
+    };
+    let head = Commit::parse(&git(&site.repo, &["rev-parse", &reference])?)?;
+    Ok((reference, head))
 }
 
 /// The highest live/<n> in git, or 0. Tags are never deleted, so this only grows.
@@ -89,7 +152,7 @@ pub fn settle(run: &Run, state: ShipState, events: Vec<ShipEvent>) -> Result<Shi
     let mut state = state;
     while let Some(event) = queue.pop_front() {
         store::append(run.paths, name, "event", json!({ "event": event }))?;
-        let plan = Plan { gates: &run.site.gates, highest };
+        let plan = Plan { gates: &run.site.gates, diff: &run.site.diff, highest };
         let (next, effects) = step(state, event, &plan);
         state = next;
         store::save_state(run.paths, name, &state)?;
@@ -106,6 +169,7 @@ pub fn settle(run: &Run, state: ShipState, events: Vec<ShipEvent>) -> Result<Shi
 fn effect_words(effect: &Effect) -> String {
     match effect {
         Effect::FetchWorktree(c) => format!("fetch a worktree at {}", c.short()),
+        Effect::MakeDiff { live, candidate } => format!("build {} and {} and compare them", live.short(), candidate.short()),
         Effect::RunGate(g) => format!("run gate \"{}\"", g.name.as_str()),
         Effect::Deploy(c) => format!("deploy {}", c.short()),
         Effect::Tag(t) => format!("tag {}", t.name()),
@@ -124,9 +188,18 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             ensure_work(run, &commit)?;
             Ok(vec![])
         }
+        Effect::MakeDiff { live, candidate } => {
+            let (DiffPolicy::Show { build } | DiffPolicy::Hold { build }) = &site.diff else {
+                return Ok(vec![ShipEvent::DiffFailed { why: "the site has no [site.diff] section but a diff was asked for".into() }]);
+            };
+            Ok(vec![match make_diff(run, build, &live, &candidate) {
+                Ok(report) => ShipEvent::DiffMade { report },
+                Err(why) => ShipEvent::DiffFailed { why },
+            }])
+        }
         Effect::RunGate(gate) => {
             let work = run.paths.work(&site.name);
-            let (ok, text) = run_in(&gate.command, &work, &target);
+            let (ok, text) = run_in(&gate.command, &work, &target, None);
             if ok {
                 Ok(vec![ShipEvent::GateDone { gate: gate.name, outcome: GateOutcome::Passed }])
             } else {
@@ -139,13 +212,13 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             if run.dry {
                 say(format!("would deploy {} to {}", commit.short(), site.name));
                 store::append(run.paths, &site.name, "would_have_deployed", json!({ "commit": commit.as_str() }))?;
-                return Ok(vec![ShipEvent::Deployed]);
+                return Ok(vec![ShipEvent::Deployed { version: VersionId::NotReported }]);
             }
             let work = ensure_work(run, &commit)?;
-            let (ok, text) = run_in(&site.deploy, &work, &target);
+            let (ok, text) = run_in(&site.deploy, &work, &target, None);
             if ok {
                 say(format!("deployed {} to {}", commit.short(), site.name));
-                Ok(vec![ShipEvent::Deployed])
+                Ok(vec![ShipEvent::Deployed { version: version_in(&site.version, &text) }])
             } else {
                 Ok(vec![ShipEvent::DeployFailed { why: tail(&text, 20) }])
             }
@@ -173,7 +246,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 return Ok(vec![ShipEvent::RollbackDone]);
             }
             let work = ensure_work(run, &tag.commit)?;
-            let (ok, text) = run_in(&site.deploy, &work, &target);
+            let (ok, text) = run_in(&site.deploy, &work, &target, None);
             if ok {
                 say(format!("redeployed {} ({}) to {}", tag.name(), tag.commit.short(), site.name));
                 Ok(vec![ShipEvent::RollbackDone])
@@ -263,8 +336,7 @@ pub fn initial_state(site: &Site, head: &Commit) -> Result<ShipState, String> {
 /// is sent. The dry-run counter is resolved from the history at the end.
 pub fn watch_site(run: &Run) -> Result<ShipState, String> {
     let site = run.site;
-    git(&site.repo, &["fetch", "origin"])?;
-    let head = Commit::parse(&git(&site.repo, &["rev-parse", &format!("origin/{}", site.branch)])?)?;
+    let (_, head) = branch_head(site)?;
     let state = match store::load_state(run.paths, &site.name)? {
         Some(state) => state,
         None => {
@@ -281,6 +353,51 @@ pub fn watch_site(run: &Run) -> Result<ShipState, String> {
     let state = result?;
     resolve(run)?;
     Ok(state)
+}
+
+/// One release of a named commit (or origin's branch head when none is named): the same machine as a watch pass. The commit must be on the
+/// site's branch, because only what is on the branch has been reviewed and gated.
+pub fn release_site(run: &Run, rev: Option<&str>) -> Result<ShipState, String> {
+    let site = run.site;
+    let (branch, head) = branch_head(site)?;
+    let commit = match rev {
+        None => head.clone(),
+        Some(rev) => {
+            let c = Commit::parse(&git(&site.repo, &["rev-parse", &format!("{rev}^{{commit}}")])?)?;
+            git(&site.repo, &["merge-base", "--is-ancestor", c.as_str(), &branch])
+                .map_err(|_| format!("{} is not on {branch}. A release comes from a commit that is on the branch; push it there first.", c.short()))?;
+            c
+        }
+    };
+    let state = match store::load_state(run.paths, &site.name)? {
+        Some(state) => state,
+        None => {
+            let state = initial_state(site, &head)?;
+            store::save_state(run.paths, &site.name, &state)?;
+            state
+        }
+    };
+    let result = (|| {
+        let state = if state.is_mid_flight() { settle(run, state, vec![ShipEvent::Resumed])? } else { state };
+        settle(run, state, vec![ShipEvent::OriginMoved { commit }])
+    })();
+    clean_work(run);
+    let state = result?;
+    resolve(run)?;
+    Ok(state)
+}
+
+/// A person approves the diff that is waiting: this commit, this digest, and a word for each kind that needed one.
+pub fn approve_site(run: &Run, digest: &str, allow: Vec<crate::diff::PathKind>) -> Result<ShipState, String> {
+    let state = store::load_state(run.paths, &run.site.name)?
+        .ok_or_else(|| format!("{} has no state yet. Run `shipd release {}` first.", run.site.name, run.site.name))?;
+    let ShipState::Diffed { candidate, .. } = &state else {
+        return Err(format!("nothing is waiting for approval on {}. It is: {}", run.site.name, words(&state)));
+    };
+    let commit = candidate.clone();
+    let result = settle(run, state, vec![ShipEvent::Approved { commit, digest: digest.to_string(), allow }]);
+    clean_work(run);
+    result
 }
 
 /// Sends a rollback request through the machine, the same way a watch pass does.

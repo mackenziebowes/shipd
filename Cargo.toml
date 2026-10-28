@@ -8,4 +8,5 @@ description = "A local watcher that deploys a site's main when every gate passes
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.1"
 toml = "0.9"

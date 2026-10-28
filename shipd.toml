@@ -27,3 +27,35 @@ command = ["bun", "tools/check-hostmsg.ts"]
 [[site.verify]]
 url = "https://www.mackenziebowes.com/"
 must_not_contain = []
+
+# okanaganregister.com. No remote: master in the local repo is the truth. Dry-run until a person flips the line below, once a release has been
+# watched end to end. The build (generate.ts) writes the site to $SHIPD_OUT for the diff; the gates and the deploy run in a clean worktree.
+# deploy.ts refuses a production run without SHIPD_RELEASE, which shipd sets.
+[[site]]
+name = "okanagan-register-site"
+repo = "~/dev/products/okanagan-register-site"
+branch = "master"
+remote = "none"
+mode = "dry-run"
+deploy = ["bun", "deploy.ts", "production"]
+version_line = "Current Version ID:"
+
+[[site.gates]]
+name = "tests"
+command = ["bun", "test"]
+
+[[site.gates]]
+name = "audit"
+command = ["sh", "-c", '''bun generate.ts "$SHIPD_TARGET/audit" --origin https://okanaganregister.com > /dev/null && bun audit.ts "$SHIPD_TARGET/audit" 300''']
+
+[site.diff]
+mode = "hold"
+build = ["sh", "-c", '''bun generate.ts "$SHIPD_OUT" --origin https://okanaganregister.com > /dev/null''']
+
+[[site.verify]]
+url = "https://okanaganregister.com/"
+must_not_contain = []
+
+[[site.verify]]
+url = "https://okanaganregister.com/fix/known.json"
+must_not_contain = []

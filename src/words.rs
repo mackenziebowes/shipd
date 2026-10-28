@@ -17,6 +17,13 @@ pub fn describe(state: &ShipState) -> String {
             live.name(),
             candidate.short()
         ),
+        ShipState::Diffing { live, candidate } => format!("building {} and {} to compare them", live.name(), candidate.short()),
+        ShipState::Diffed { candidate, report, .. } => format!(
+            "waiting for approval: the diff for {} is shown. Approve with `shipd approve SITE {}{}`",
+            candidate.short(),
+            report.digest.get(..12).unwrap_or(&report.digest),
+            if report.flagged.is_empty() { String::new() } else { format!(" --allow {}", report.flagged.iter().map(|k| k.name()).collect::<Vec<_>>().join(",")) }
+        ),
         ShipState::Deploying { previous, candidate } => format!("deploying {} over {}", candidate.short(), previous.name()),
         ShipState::Verifying { now, .. } => format!("checking {} ({}) against the live checks", now.name(), now.commit.short()),
         ShipState::Failed { live, candidate, why } => format!(

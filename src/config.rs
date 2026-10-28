@@ -13,10 +13,23 @@ struct RawSite {
     name: String,
     repo: String,
     branch: String,
+    /// "none" for a repo with no remote: the local branch is the truth. Leave out for "origin".
+    remote: Option<String>,
     mode: String,
     gates: Vec<RawGate>,
     deploy: Vec<String>,
+    /// The line of the deploy output that starts with this holds the platform's version id. Leave out if it reports none.
+    version_line: Option<String>,
+    diff: Option<RawDiff>,
     verify: Vec<RawCheck>,
+}
+
+#[derive(Deserialize)]
+struct RawDiff {
+    /// "show" or "hold".
+    mode: String,
+    /// Builds the site into $SHIPD_OUT.
+    build: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -73,13 +86,34 @@ fn site(s: &RawSite) -> Result<Site, String> {
             Ok(Gate { name, command: g.command.clone() })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let diff = match &s.diff {
+        None => DiffPolicy::Off,
+        Some(d) if d.build.is_empty() => return Err(format!("site \"{}\": [site.diff] has an empty build command. It must write the built site to $SHIPD_OUT.", s.name)),
+        Some(d) => match d.mode.as_str() {
+            "show" => DiffPolicy::Show { build: d.build.clone() },
+            "hold" => DiffPolicy::Hold { build: d.build.clone() },
+            other => return Err(format!("site \"{}\": [site.diff] mode is \"{other}\", but it must be \"show\" or \"hold\"", s.name)),
+        },
+    };
+    let version = match &s.version_line {
+        None => VersionSource::NotReported,
+        Some(p) if p.trim().is_empty() => return Err(format!("site \"{}\": version_line is empty; leave it out if the deploy reports no version", s.name)),
+        Some(p) => VersionSource::DeployLine { prefix: p.clone() },
+    };
     Ok(Site {
         name: s.name.clone(),
         repo: expand_home(&s.repo),
         branch: s.branch.clone(),
+        source: match s.remote.as_deref() {
+            None => BranchSource::Remote { name: "origin".into() },
+            Some("none") => BranchSource::Local,
+            Some(name) => BranchSource::Remote { name: name.into() },
+        },
         mode,
         gates,
         deploy: s.deploy.clone(),
+        version,
+        diff,
         verify: s.verify.iter().map(|v| Check { url: v.url.clone(), must_not_contain: v.must_not_contain.clone() }).collect(),
     })
 }

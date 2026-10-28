@@ -1,6 +1,7 @@
 //! The domain: what a site's ship state is made of, and what the machine can ask for. No IO lives here.
 //! Text is parsed at the edge (config, git output, the command line) into these types, so nothing past it guesses.
 use serde::{Deserialize, Serialize};
+use crate::diff::{DiffReport, PathKind};
 use std::path::PathBuf;
 
 /// A full 40-character lowercase commit id, as git prints it.
@@ -43,9 +44,9 @@ impl ShipState {
     pub fn highest_number(&self) -> u32 {
         let tags: Vec<&LiveTag> = match self {
             ShipState::Idle { live, previous } => vec![live, previous],
-            ShipState::Gating { live, .. } | ShipState::Blocked { live, .. } | ShipState::Failed { live, .. } => vec![live],
+            ShipState::Gating { live, .. } | ShipState::Diffing { live, .. } | ShipState::Diffed { live, .. } | ShipState::Blocked { live, .. } | ShipState::Failed { live, .. } => vec![live],
             ShipState::Deploying { previous, .. } => vec![previous],
-            ShipState::Verifying { previous, now } => vec![previous, now],
+            ShipState::Verifying { previous, now, .. } => vec![previous, now],
             ShipState::RollingBack { failed, to, .. } => vec![failed, to],
             ShipState::Held { live, rejected, .. } | ShipState::RollbackFailed { live, rejected, .. } => vec![live, rejected],
         };
@@ -54,7 +55,7 @@ impl ShipState {
 
     /// A state a process can be killed in the middle of: its effect has to run again.
     pub fn is_mid_flight(&self) -> bool {
-        matches!(self, ShipState::Gating { .. } | ShipState::Deploying { .. } | ShipState::Verifying { .. } | ShipState::RollingBack { .. })
+        matches!(self, ShipState::Gating { .. } | ShipState::Diffing { .. } | ShipState::Deploying { .. } | ShipState::Verifying { .. } | ShipState::RollingBack { .. })
     }
 }
 
@@ -105,9 +106,13 @@ pub enum ShipState {
     Gating { live: LiveTag, candidate: Commit, done: Vec<GateName> },
     /// A gate failed. Nothing deploys from here until origin moves to a newer commit.
     Blocked { live: LiveTag, candidate: Commit, failed: GateName, report: String },
+    /// The gates passed. The live commit and the candidate are being built into two folders to be compared.
+    Diffing { live: LiveTag, candidate: Commit },
+    /// The diff was made and shown, and a person has to approve exactly this diff (its digest) before anything deploys.
+    Diffed { live: LiveTag, candidate: Commit, report: DiffReport },
     Deploying { previous: LiveTag, candidate: Commit },
-    /// The deploy ran. The live URLs are being checked, and `now` is the tag that would be live.
-    Verifying { previous: LiveTag, now: LiveTag },
+    /// The deploy ran. The live URLs are being checked, and `now` is the tag that would be live. `version` is the platform's id for it.
+    Verifying { previous: LiveTag, now: LiveTag, version: VersionId },
     /// The deploy command itself failed. Live is still `live`.
     Failed { live: LiveTag, candidate: Commit, why: String },
     /// The live check failed, or a person asked. The previous tag is being redeployed.
@@ -123,7 +128,12 @@ pub enum ShipState {
 pub enum ShipEvent {
     OriginMoved { commit: Commit },
     GateDone { gate: GateName, outcome: GateOutcome },
-    Deployed,
+    /// The diff of the live build against the candidate's build was made.
+    DiffMade { report: DiffReport },
+    DiffFailed { why: String },
+    /// A person approved the diff with this digest for this commit, and said these kinds of change (routing, code) were meant.
+    Approved { commit: Commit, digest: String, allow: Vec<PathKind> },
+    Deployed { version: VersionId },
     DeployFailed { why: String },
     Verified,
     VerifyFailed { why: String },
@@ -137,6 +147,8 @@ pub enum ShipEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     FetchWorktree(Commit),
+    /// Build `live` and `candidate` into two folders and compare them.
+    MakeDiff { live: Commit, candidate: Commit },
     RunGate(Gate),
     Deploy(Commit),
     Tag(LiveTag),
@@ -152,6 +164,46 @@ pub enum Mode {
     Live,
 }
 
+/// Where a site's branch lives: on a remote (fetched before every pass), or only in the local repo (for a site with no remote).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchSource {
+    Remote { name: String },
+    Local,
+}
+
+/// What a site does between its gates and its deploy. `Show` builds both and prints the diff, then goes on (unless the diff needs a
+/// word or loses a page). `Hold` builds both, prints the diff and waits for `shipd approve`. The build command writes the built site to $SHIPD_OUT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffPolicy {
+    Off,
+    Show { build: Vec<String> },
+    Hold { build: Vec<String> },
+}
+
+/// Where the platform's id for a deploy is found: on the line of the deploy command's output that starts with `prefix`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionSource {
+    NotReported,
+    DeployLine { prefix: String },
+}
+
+/// The platform's id for a deploy, or the plain fact that the deploy did not report one. Never an empty string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", content = "id", rename_all = "snake_case")]
+pub enum VersionId {
+    Found(String),
+    NotReported,
+}
+
+impl VersionId {
+    pub fn words(&self) -> String {
+        match self {
+            VersionId::Found(id) => format!("version {id}"),
+            VersionId::NotReported => "no version id reported".into(),
+        }
+    }
+}
+
 /// One URL the live site must answer with 200 and without any of the strings the change removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Check {
@@ -165,8 +217,11 @@ pub struct Site {
     pub name: String,
     pub repo: PathBuf,
     pub branch: String,
+    pub source: BranchSource,
     pub mode: Mode,
     pub gates: Vec<Gate>,
     pub deploy: Vec<String>,
+    pub version: VersionSource,
+    pub diff: DiffPolicy,
     pub verify: Vec<Check>,
 }
