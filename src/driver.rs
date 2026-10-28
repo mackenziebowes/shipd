@@ -117,13 +117,26 @@ fn build_into(run: &Run, build: &[String], commit: &Commit, out: &Path) -> Resul
 }
 
 /// Builds the live commit and the candidate into two folders beside the worktree (never in /tmp), compares them, and removes both.
-fn make_diff(run: &Run, build: &[String], live: &Commit, candidate: &Commit) -> Result<crate::diff::DiffReport, String> {
+fn make_diff(run: &Run, build: &[String], deploy_files: &[String], live: &Commit, candidate: &Commit) -> Result<crate::diff::DiffReport, String> {
     let dir = run.paths.site_dir(&run.site.name);
     let (live_out, next_out) = (dir.join("diff-live"), dir.join("diff-next"));
     let result = (|| {
         build_into(run, build, live, &live_out)?;
         build_into(run, build, candidate, &next_out)?;
         let summary = crate::diff::diff_trees(&crate::diff::Tree::read(&live_out)?, &crate::diff::Tree::read(&next_out)?);
+        // The site's own deploy files are not in the build output: ask git what differs in them between the two commits.
+        let summary = if deploy_files.is_empty() {
+            summary
+        } else {
+            let mut args = vec!["diff", live.as_str(), candidate.as_str(), "--"];
+            args.extend(deploy_files.iter().map(String::as_str));
+            let patch = git(&run.site.repo, &args)?;
+            let mut names = vec!["diff", "--name-only", live.as_str(), candidate.as_str(), "--"];
+            names.extend(deploy_files.iter().map(String::as_str));
+            let changed: Vec<String> = git(&run.site.repo, &names)?.lines().map(String::from).collect();
+            let digest: String = sha2::Digest::finalize(sha2::Digest::chain_update(sha2::Sha256::default(), patch.as_bytes())).iter().map(|b| format!("{b:02x}")).collect();
+            summary.with_deploy(changed, digest)
+        };
         Ok(summary.report(40))
     })();
     // The live build is only for the comparison. The candidate's folder is kept: it is what the approval is about, and what the deploy ships.
@@ -145,6 +158,56 @@ fn version_in(source: &VersionSource, output: &str) -> VersionId {
         .filter(|id| !id.is_empty())
         .map(|id| VersionId::Found(id.to_string()))
         .unwrap_or(VersionId::NotReported)
+}
+
+/// Commits, by path, the files a release produced in its checkout that belong on the branch (the site's `land` list), so the next agent's
+/// `git add -A` does not sweep them into an unrelated commit and nobody has to remember to commit them. Only for a local branch that is checked out in
+/// the repo; says so when it cannot. A failure here never undoes the deploy: it is said out loud.
+fn land(run: &Run, tag: &LiveTag) -> Option<Commit> {
+    let site = run.site;
+    if site.land.is_empty() {
+        return None;
+    }
+    let result = (|| -> Result<Option<Commit>, String> {
+        if site.source != BranchSource::Local {
+            return Err("this site's branch is on a remote; commit the files by hand".into());
+        }
+        if git(&site.repo, &["rev-parse", "--abbrev-ref", "HEAD"])? != site.branch {
+            return Err(format!("the repo is not on {}; commit the files by hand", site.branch));
+        }
+        let work = run.paths.work(&site.name);
+        let mut moved: Vec<&str> = Vec::new();
+        for file in &site.land {
+            let from = work.join(file);
+            if !from.exists() {
+                continue;
+            }
+            let to = site.repo.join(file);
+            if std::fs::read(&from).ok() != std::fs::read(&to).ok() {
+                std::fs::copy(&from, &to).map_err(|e| format!("cannot copy {file}: {e}"))?;
+                moved.push(file);
+            }
+        }
+        if moved.is_empty() {
+            return Ok(None);
+        }
+        let mut add = vec!["add", "--"];
+        add.extend(moved.iter().copied());
+        git(&site.repo, &add)?;
+        let message = format!("shipd: {} from release {} ({})", moved.join(", "), tag.name(), tag.commit.short());
+        let mut commit = vec!["commit", "-q", "-m", message.as_str(), "--"];
+        commit.extend(moved.iter().copied());
+        git(&site.repo, &commit)?;
+        say(format!("landed: committed {} on {}", moved.join(", "), site.branch));
+        Ok(Some(Commit::parse(&git(&site.repo, &["rev-parse", "HEAD"])?)?))
+    })();
+    match result {
+        Ok(landed) => landed,
+        Err(why) => {
+            say(format!("NOT LANDED: {why}. The files are in {}", run.paths.work(&site.name).display()));
+            None
+        }
+    }
 }
 
 /// The site's install step, run in a fresh checkout. Nothing when the site has none.
@@ -236,10 +299,10 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             Ok(vec![])
         }
         Effect::MakeDiff { live, candidate } => {
-            let (DiffPolicy::Show { build } | DiffPolicy::Hold { build }) = &site.diff else {
+            let (DiffPolicy::Show { build, deploy_files } | DiffPolicy::Hold { build, deploy_files }) = &site.diff else {
                 return Ok(vec![ShipEvent::DiffFailed { why: "the site has no [site.diff] section but a diff was asked for".into() }]);
             };
-            Ok(vec![match make_diff(run, build, &live, &candidate) {
+            Ok(vec![match make_diff(run, build, deploy_files, &live, &candidate) {
                 Ok(report) => ShipEvent::DiffMade { report },
                 Err(why) => ShipEvent::DiffFailed { why },
             }])
@@ -301,9 +364,12 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             if !git(&site.repo, &["tag", "--list", &tag.name()])?.is_empty() {
                 return Err(format!("{} already exists; tags are never moved, so the number is not reused", tag.name()));
             }
-            git(&site.repo, &["tag", &tag.name(), tag.commit.as_str()])?;
-            say(format!("tagged {} at {}", tag.name(), tag.commit.short()));
-            Ok(vec![])
+            // The release's own output is committed first, and the tag names that commit: it is the branch head that is live.
+            let landed = land(run, &tag);
+            let at = landed.clone().unwrap_or_else(|| tag.commit.clone());
+            git(&site.repo, &["tag", &tag.name(), at.as_str()])?;
+            say(format!("tagged {} at {}", tag.name(), at.short()));
+            Ok(landed.into_iter().map(|commit| ShipEvent::Landed { commit }).collect())
         }
         Effect::VerifyLive => Ok(match verify(site, run.dry) {
             None => vec![ShipEvent::Verified],

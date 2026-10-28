@@ -121,6 +121,9 @@ pub fn step(state: ShipState, event: ShipEvent, plan: &Plan) -> Step {
             waiting(kept, live, candidate, commit, plan)
         }
 
+        // Landed: the release committed its own output on the branch. That commit is live, not a new candidate.
+        (S::Idle { live, previous }, E::Landed { commit }) => (S::Idle { live: LiveTag { n: live.n, commit }, previous }, vec![]),
+
         // Blocked: nothing deploys until origin moves to a newer commit. The same candidate changes nothing.
         (S::Blocked { live, candidate, failed, report }, E::OriginMoved { commit }) => {
             let kept = S::Blocked { live: live.clone(), candidate: candidate.clone(), failed, report };
@@ -285,6 +288,7 @@ fn event_name(event: &ShipEvent) -> &'static str {
         ShipEvent::GateDone { .. } => "a gate result",
         ShipEvent::DiffMade { .. } | ShipEvent::DiffFailed { .. } => "a diff result",
         ShipEvent::Approved { .. } => "an approval",
+        ShipEvent::Landed { .. } => "a landed commit",
         ShipEvent::Deployed { .. } | ShipEvent::DeployFailed { .. } => "a deploy result",
         ShipEvent::Verified | ShipEvent::VerifyFailed { .. } => "a live check result",
         ShipEvent::RollbackRequested => "a rollback request",

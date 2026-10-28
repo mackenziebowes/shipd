@@ -22,6 +22,8 @@ struct RawSite {
     version_line: Option<String>,
     /// Run in each clean checkout before the gates (for example ["bun", "install", "--frozen-lockfile"]).
     install: Option<Vec<String>>,
+    /// Files the release produces in its checkout that belong on the branch, committed by path after a verified deploy (only when the branch is local).
+    land: Option<Vec<String>>,
     /// Seconds one command may run before it is stopped. 1800 when left out.
     command_limit_seconds: Option<u64>,
     diff: Option<RawDiff>,
@@ -34,6 +36,8 @@ struct RawDiff {
     mode: String,
     /// Builds the site into $SHIPD_OUT.
     build: Vec<String>,
+    /// Git pathspecs of the site's own deploy files, whose change needs `--allow deploy` ("deploy.ts", "wrangler*.jsonc").
+    deploy_files: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -94,8 +98,8 @@ fn site(s: &RawSite) -> Result<Site, String> {
         None => DiffPolicy::Off,
         Some(d) if d.build.is_empty() => return Err(format!("site \"{}\": [site.diff] has an empty build command. It must write the built site to $SHIPD_OUT.", s.name)),
         Some(d) => match d.mode.as_str() {
-            "show" => DiffPolicy::Show { build: d.build.clone() },
-            "hold" => DiffPolicy::Hold { build: d.build.clone() },
+            "show" => DiffPolicy::Show { build: d.build.clone(), deploy_files: d.deploy_files.clone().unwrap_or_default() },
+            "hold" => DiffPolicy::Hold { build: d.build.clone(), deploy_files: d.deploy_files.clone().unwrap_or_default() },
             other => return Err(format!("site \"{}\": [site.diff] mode is \"{other}\", but it must be \"show\" or \"hold\"", s.name)),
         },
     };
@@ -119,6 +123,7 @@ fn site(s: &RawSite) -> Result<Site, String> {
         version,
         diff,
         install: s.install.clone().unwrap_or_default(),
+        land: s.land.clone().unwrap_or_default(),
         command_limit: std::time::Duration::from_secs(match s.command_limit_seconds {
             None => 1800,
             Some(0) => return Err(format!("site \"{}\": command_limit_seconds is 0; give a number of seconds above 0", s.name)),

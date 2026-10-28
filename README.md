@@ -42,4 +42,11 @@ output line that starts with `version_line`) and the rollback line.
 6. **Commands stop.** Any one command (gate, build, deploy, install) is stopped, with its whole process group, after `command_limit_seconds` (1800 when
    left out), with a message. Each build starts from a clean checkout (`git clean -fdx`); a site that needs `node_modules` or the like sets
    `install = ["bun", "install", "--frozen-lockfile"]`, which runs in every fresh checkout.
-7. **No remote.** `remote = "none"` makes the local branch the truth.
+7. **Deploy files.** The build output is not all that changes what production does. `deploy_files = ["deploy.ts", "wrangler*.jsonc"]` in `[site.diff]` are git
+   pathspecs: files that differ in git between the live commit and the candidate are listed at the top of the diff with the kind `deploy`, and need
+   `--allow deploy`, though the build output is identical.
+8. **Landing.** `land = ["data/published-urls.txt"]` names files a release produces in its checkout that belong on the branch. After a verified deploy
+   shipd commits them by path (only for a local branch that is checked out in the repo), tags the landed commit as `live/<n>`, and treats it as live, so
+   it is not released again. If it cannot, it says `NOT LANDED` and where the files are. A hand run of the site's deploy script still writes into the
+   shared tree.
+9. **No remote.** `remote = "none"` makes the local branch the truth.

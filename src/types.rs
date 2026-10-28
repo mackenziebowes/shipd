@@ -134,6 +134,8 @@ pub enum ShipEvent {
     /// A person approved the diff with this digest for this commit, and said these kinds of change (routing, code) were meant.
     Approved { commit: Commit, digest: String, allow: Vec<PathKind> },
     Deployed { version: VersionId },
+    /// The files a release produced were committed on the branch: this commit is the branch head, and the live tag names it, so it is not a new candidate.
+    Landed { commit: Commit },
     DeployFailed { why: String },
     Verified,
     VerifyFailed { why: String },
@@ -181,12 +183,13 @@ pub enum BranchSource {
 }
 
 /// What a site does between its gates and its deploy. `Show` builds both and prints the diff, then goes on (unless the diff needs a
-/// word or loses a page). `Hold` builds both, prints the diff and waits for `shipd approve`. The build command writes the built site to $SHIPD_OUT.
+/// word or loses a page). `deploy_files` are git pathspecs of the site's own deploy files (its deploy script, its wrangler config): a change in any of
+/// them between the live commit and the candidate is listed and needs `--allow deploy`, though the build output is identical. `Hold` builds both, prints the diff and waits for `shipd approve`. The build command writes the built site to $SHIPD_OUT.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiffPolicy {
     Off,
-    Show { build: Vec<String> },
-    Hold { build: Vec<String> },
+    Show { build: Vec<String>, deploy_files: Vec<String> },
+    Hold { build: Vec<String>, deploy_files: Vec<String> },
 }
 
 /// Where the platform's id for a deploy is found: on the line of the deploy command's output that starts with `prefix`.
@@ -234,6 +237,8 @@ pub struct Site {
     pub diff: DiffPolicy,
     /// Run in every fresh checkout before anything else (the checkout is cleaned of untracked files first). Empty: nothing to install.
     pub install: Vec<String>,
+    /// Files a release produces in its checkout that belong on the branch (for example a list of published addresses): committed by path after a verified deploy.
+    pub land: Vec<String>,
     /// The longest any one command of this site may run.
     pub command_limit: std::time::Duration,
     pub verify: Vec<Check>,

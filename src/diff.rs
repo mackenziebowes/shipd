@@ -31,6 +31,8 @@ pub enum PathKind {
     Routing,
     /// Files that run: server code, WebAssembly, and SVG (which can carry script).
     Code,
+    /// The site's own deploy files (its deploy script, its wrangler config): not in the build output, but they change what production does.
+    Deploy,
     Other,
 }
 
@@ -63,24 +65,27 @@ impl PathKind {
             PathKind::Image => "images and fonts",
             PathKind::Routing => "routing and crawler files",
             PathKind::Code => "files that run (php, wasm, svg)",
+            PathKind::Deploy => "deploy files (not in the build output)",
             PathKind::Other => "other files",
         }
     }
     /// Kinds whose change a person must name when approving.
     pub fn needs_word(self) -> bool {
-        matches!(self, PathKind::Routing | PathKind::Code)
+        matches!(self, PathKind::Routing | PathKind::Code | PathKind::Deploy)
     }
     pub fn parse(text: &str) -> Result<PathKind, String> {
         match text {
             "routing" => Ok(PathKind::Routing),
             "code" => Ok(PathKind::Code),
-            other => Err(format!("{other:?} is not a kind that needs a word; the kinds are routing and code")),
+            "deploy" => Ok(PathKind::Deploy),
+            other => Err(format!("{other:?} is not a kind that needs a word; the kinds are routing, code and deploy")),
         }
     }
     pub fn name(self) -> &'static str {
         match self {
             PathKind::Routing => "routing",
             PathKind::Code => "code",
+            PathKind::Deploy => "deploy",
             PathKind::Page => "page",
             PathKind::Stylesheet => "stylesheet",
             PathKind::Script => "script",
@@ -177,6 +182,10 @@ pub struct DiffSummary {
     pub changed: Vec<ChangedPath>,
     /// Removed pages that the candidate's `_redirects` does not send anywhere.
     pub gone_without_redirect: Vec<RelPath>,
+    /// Files of the site's own deploy set (named by pathspec in the config) that differ in git between the live commit and the candidate.
+    pub deploy_changed: Vec<String>,
+    /// SHA-256 of the git diff of those files, so an approval is bound to their exact change.
+    pub deploy_digest: String,
 }
 
 /// `live` is the folder now serving; `candidate` is the one about to.
@@ -208,7 +217,7 @@ pub fn diff_trees(live: &Tree, candidate: &Tree) -> DiffSummary {
         .filter(|c| c.change == Change::Removed && c.kind == PathKind::Page && !covered(&rules, &c.path, candidate))
         .map(|c| c.path.clone())
         .collect();
-    DiffSummary { tree_digest: candidate.digest(), unchanged, by_kind: counts.into_iter().collect(), changed, gone_without_redirect }
+    DiffSummary { tree_digest: candidate.digest(), unchanged, by_kind: counts.into_iter().collect(), changed, gone_without_redirect, deploy_changed: vec![], deploy_digest: String::new() }
 }
 
 /// One line of a `_redirects` file: where from, where to, and the status (301 when the line gives none).
@@ -291,13 +300,24 @@ impl DiffSummary {
         for c in &self.changed {
             h.update(format!("{}\t{}\n", c.path.as_str(), c.fingerprints));
         }
+        h.update(format!("deploy\t{}\n", self.deploy_digest));
         let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let flagged = self.by_kind.iter().filter(|(k, _)| k.needs_word()).map(|(k, _)| *k).collect();
+        let mut flagged: Vec<PathKind> = self.by_kind.iter().filter(|(k, _)| k.needs_word()).map(|(k, _)| *k).collect();
+        if !self.deploy_changed.is_empty() {
+            flagged.push(PathKind::Deploy);
+        }
         DiffReport { text: self.render(max_paths), tree_digest: self.tree_digest.clone(), digest, flagged, gone_without_redirect: self.gone_without_redirect.clone() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty()
+        self.changed.is_empty() && self.deploy_changed.is_empty()
+    }
+
+    /// Adds the files of the deploy set that differ in git, found by the caller (git is an edge).
+    pub fn with_deploy(mut self, changed: Vec<String>, digest: String) -> DiffSummary {
+        self.deploy_changed = changed;
+        self.deploy_digest = digest;
+        self
     }
 
     /// The summary in words: a line per kind, then up to `max_paths` changed paths, the ones that change serving first and pages last.
@@ -305,7 +325,11 @@ impl DiffSummary {
         if self.is_empty() {
             return format!("nothing changed: all {} files are identical to live\n", self.unchanged);
         }
-        let mut out = format!("{} files changed, {} unchanged (the build of the commit tagged live/N against the build of the candidate, not against the site being served)\n", self.changed.len(), self.unchanged);
+        let mut out = String::new();
+        if !self.deploy_changed.is_empty() {
+            out.push_str(&format!("DEPLOY FILES CHANGED (not in the build output; they change what production does): {}  <- needs a word at approval\n", self.deploy_changed.join(", ")));
+        }
+        out.push_str(&format!("{} files changed, {} unchanged (the build of the commit tagged live/N against the build of the candidate, not against the site being served)\n", self.changed.len(), self.unchanged));
         for (kind, n) in &self.by_kind {
             let flag = if kind.needs_word() { "  <- needs a word at approval" } else { "" };
             out.push_str(&format!("  {}: {} added, {} removed, {} changed{flag}\n", kind.plural(), n.added, n.removed, n.changed));

@@ -39,6 +39,7 @@ remote = "none"
 mode = "dry-run"
 deploy = ["bun", "deploy.ts", "production"]
 version_line = "Current Version ID:"
+land = ["data/published-urls.txt"]
 
 [[site.gates]]
 name = "tests"
@@ -51,6 +52,7 @@ command = ["sh", "-c", '''bun generate.ts "$SHIPD_TARGET/audit" --origin https:/
 [site.diff]
 mode = "hold"
 build = ["sh", "-c", '''bun generate.ts "$SHIPD_OUT" --origin https://okanaganregister.com > /dev/null''']
+deploy_files = ["deploy.ts", "wrangler*.jsonc", "worker.ts", "receiver.ts"]
 
 [[site.verify]]
 url = "https://okanaganregister.com/"
