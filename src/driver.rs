@@ -30,19 +30,18 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The longest any one command may run. A build or a gate that hangs fails with a message instead of hanging shipd.
-const COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
 /// Runs a command in `dir`, with SHIPD_TARGET set to the site's shared build directory, SHIPD_RELEASE set (a site's own deploy script
 /// refuses to deploy to production without it) and any `extra` variables. Returns success and the output.
-fn run_in(cmd: &[String], dir: &Path, target: &Path, extra: &[(&str, &Path)]) -> (bool, String) {
+fn run_in(cmd: &[String], dir: &Path, target: &Path, extra: &[(&str, &str)], limit: std::time::Duration) -> (bool, String) {
     use std::io::Read;
     use std::process::Stdio;
     let Some((prog, rest)) = cmd.split_first() else {
         return (false, "the command is empty".into());
     };
     let mut command = Command::new(prog);
-    command.args(rest).current_dir(dir).env("SHIPD_TARGET", target).env("SHIPD_RELEASE", "1").stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Its own process group, so a timeout stops the whole tree (sh, bun, node, wrangler) and not only its first process.
+    use std::os::unix::process::CommandExt;
+    command.args(rest).current_dir(dir).env("SHIPD_TARGET", target).env("SHIPD_RELEASE", "1").stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     for (name, value) in extra {
         command.env(name, value);
     }
@@ -65,10 +64,11 @@ fn run_in(cmd: &[String], dir: &Path, target: &Path, extra: &[(&str, &Path)]) ->
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) if started.elapsed() > COMMAND_LIMIT => {
+            Ok(None) if started.elapsed() > limit => {
+                let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(format!("{prog} ran over {} minutes and was stopped", COMMAND_LIMIT.as_secs() / 60));
+                break Err(format!("{prog} ran over {} seconds and was stopped", limit.as_secs()));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(e) => break Err(format!("cannot wait for {prog}: {e}")),
@@ -93,10 +93,12 @@ fn ensure_work(run: &Run, commit: &Commit) -> Result<PathBuf, String> {
         git(&work, &["checkout", "--detach", "-f", commit.as_str()])?;
         // nothing the previous build left behind (untracked or ignored files) may reach this one
         git(&work, &["clean", "-fdxq"])?;
+        install(run, &work)?;
     } else {
         std::fs::create_dir_all(run.paths.site_dir(&run.site.name)).map_err(|e| e.to_string())?;
         let work_text = work.to_string_lossy().to_string();
         git(&run.site.repo, &["worktree", "add", "--detach", &work_text, commit.as_str()])?;
+        install(run, &work)?;
     }
     Ok(work)
 }
@@ -106,7 +108,7 @@ fn build_into(run: &Run, build: &[String], commit: &Commit, out: &Path) -> Resul
     let work = ensure_work(run, commit)?;
     let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(out).map_err(|e| format!("cannot make {}: {e}", out.display()))?;
-    let (ok, text) = run_in(build, &work, &run.paths.target(&run.site.name), &[("SHIPD_OUT", out)]);
+    let (ok, text) = run_in(build, &work, &run.paths.target(&run.site.name), &[("SHIPD_OUT", &out.to_string_lossy())], run.site.command_limit);
     if ok {
         Ok(())
     } else {
@@ -143,6 +145,19 @@ fn version_in(source: &VersionSource, output: &str) -> VersionId {
         .filter(|id| !id.is_empty())
         .map(|id| VersionId::Found(id.to_string()))
         .unwrap_or(VersionId::NotReported)
+}
+
+/// The site's install step, run in a fresh checkout. Nothing when the site has none.
+fn install(run: &Run, work: &Path) -> Result<(), String> {
+    if run.site.install.is_empty() {
+        return Ok(());
+    }
+    let (ok, text) = run_in(&run.site.install, work, &run.paths.target(&run.site.name), &[], run.site.command_limit);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("the install step ({}) failed: {}", run.site.install.join(" "), tail(&text, 20)))
+    }
 }
 
 /// Removes the site's worktree, so nothing is left behind after a pass.
@@ -231,7 +246,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
         }
         Effect::RunGate(gate) => {
             let work = run.paths.work(&site.name);
-            let (ok, text) = run_in(&gate.command, &work, &target, &[]);
+            let (ok, text) = run_in(&gate.command, &work, &target, &[], site.command_limit);
             if ok {
                 Ok(vec![ShipEvent::GateDone { gate: gate.name, outcome: GateOutcome::Passed }])
             } else {
@@ -250,12 +265,21 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
             // With a diff step the approved folder was kept. It is hashed again now, and the deploy is handed it: what ships is what a person saw.
             let kept = run.paths.site_dir(&site.name).join("diff-next");
             let (ok, text) = match &built {
-                Built::BySiteDeploy => run_in(&site.deploy, &work, &target, &[]),
+                Built::BySiteDeploy => run_in(&site.deploy, &work, &target, &[], site.command_limit),
                 Built::KeptFolder { tree_digest } => match crate::diff::Tree::read(&kept) {
-                    Ok(tree) if tree.digest() == *tree_digest => run_in(&site.deploy, &work, &target, &[("SHIPD_APPROVED_DIR", kept.as_path())]),
+                    Ok(tree) if tree.digest() == *tree_digest => run_in(&site.deploy, &work, &target, &[("SHIPD_APPROVED_DIR", &kept.to_string_lossy()), ("SHIPD_APPROVED_DIGEST", tree_digest)], site.command_limit),
                     Ok(_) => (false, format!("the folder that was approved ({}) changed on disk after the diff was made; nothing was deployed. Run the release again.", kept.display())),
                     Err(e) => (false, format!("the folder that was approved is not there to deploy: {e}. Run the release again.")),
                 },
+            };
+            // The deploy must say which folder it shipped. A script that ignored SHIPD_APPROVED_DIR and built for itself prints another digest, or none.
+            let (ok, text) = match (&built, ok) {
+                (Built::KeptFolder { tree_digest }, true) => match text.lines().find_map(|l| l.trim().strip_prefix("Uploaded digest:")).map(str::trim) {
+                    Some(d) if d == tree_digest => (true, text),
+                    Some(d) => (false, format!("the deploy ran, but it shipped a folder with digest {d}, not the approved {tree_digest}. Live may now hold a build nobody approved: check it.\n{text}")),
+                    None => (false, format!("the deploy ran but did not print an `Uploaded digest:` line, so it cannot be shown to have shipped the approved folder. Live may hold a build nobody approved: check it.\n{text}")),
+                },
+                _ => (ok, text),
             };
             if matches!(built, Built::KeptFolder { .. }) {
                 let _ = std::fs::remove_dir_all(&kept);
@@ -291,7 +315,7 @@ fn execute(run: &Run, effect: Effect) -> Result<Vec<ShipEvent>, String> {
                 return Ok(vec![ShipEvent::RollbackDone]);
             }
             let work = ensure_work(run, &tag.commit)?;
-            let (ok, text) = run_in(&site.deploy, &work, &target, &[]);
+            let (ok, text) = run_in(&site.deploy, &work, &target, &[], site.command_limit);
             if ok {
                 say(format!("redeployed {} ({}) to {}", tag.name(), tag.commit.short(), site.name));
                 Ok(vec![ShipEvent::RollbackDone])

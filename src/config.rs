@@ -20,6 +20,10 @@ struct RawSite {
     deploy: Vec<String>,
     /// The line of the deploy output that starts with this holds the platform's version id. Leave out if it reports none.
     version_line: Option<String>,
+    /// Run in each clean checkout before the gates (for example ["bun", "install", "--frozen-lockfile"]).
+    install: Option<Vec<String>>,
+    /// Seconds one command may run before it is stopped. 1800 when left out.
+    command_limit_seconds: Option<u64>,
     diff: Option<RawDiff>,
     verify: Vec<RawCheck>,
 }
@@ -114,6 +118,12 @@ fn site(s: &RawSite) -> Result<Site, String> {
         deploy: s.deploy.clone(),
         version,
         diff,
+        install: s.install.clone().unwrap_or_default(),
+        command_limit: std::time::Duration::from_secs(match s.command_limit_seconds {
+            None => 1800,
+            Some(0) => return Err(format!("site \"{}\": command_limit_seconds is 0; give a number of seconds above 0", s.name)),
+            Some(n) => n,
+        }),
         verify: s.verify.iter().map(|v| Check { url: v.url.clone(), must_not_contain: v.must_not_contain.clone() }).collect(),
     })
 }

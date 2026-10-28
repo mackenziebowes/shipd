@@ -232,5 +232,9 @@ pub struct Site {
     pub deploy: Vec<String>,
     pub version: VersionSource,
     pub diff: DiffPolicy,
+    /// Run in every fresh checkout before anything else (the checkout is cleaned of untracked files first). Empty: nothing to install.
+    pub install: Vec<String>,
+    /// The longest any one command of this site may run.
+    pub command_limit: std::time::Duration,
     pub verify: Vec<Check>,
 }

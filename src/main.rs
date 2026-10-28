@@ -28,6 +28,7 @@ Commands:
   approve SITE DIGEST [--allow routing,code]
                               approve the diff that is waiting, by its digest
   diff LIVE_DIR NEXT_DIR      say which files differ between two built folders
+  digest DIR                  print the SHA-256 that names a built folder (what an approval and a deploy are held to)
 
 The config is shipd.toml: $SHIPD_CONFIG, or ~/.config/shipd/shipd.toml, unless --config says otherwise.
 State and history are kept under $SHIPD_HOME, or ~/.local/share/shipd.
@@ -65,6 +66,12 @@ fn run(args: &[String]) -> Result<(), String> {
         "release" => release(&config_path, &paths, rest),
         "approve" => approve(&config_path, &paths, rest),
         "diff" => diff_command(rest),
+        "digest" => {
+            let pos = positional(rest);
+            let [dir] = pos.as_slice() else { return Err("usage: shipd digest DIR".into()) };
+            println!("{}", diff::Tree::read(std::path::Path::new(dir.as_str()))?.digest());
+            Ok(())
+        }
         other => Err(format!("no command called \"{other}\". Try `shipd --help`.")),
     }
 }
@@ -195,6 +202,7 @@ fn help(command: &str) -> String {
         "mark-live" => "shipd mark-live SITE COMMIT\n\nRecords that a person deployed COMMIT by hand. If shipd would have deployed the same commit in\ndry-run, that is counted as agreed; a different commit is disagreed.".into(),
         "release" => "shipd release SITE [--commit REV] [--dry-run]\n\nSends one commit (REV, which must be on the site's branch; or the branch head) through the same machine as `watch`: the gates in a clean\nworktree, then the diff against live if the site has a [site.diff] section, then the deploy, the live check and the live/<n> tag. With\nmode \"hold\" it stops after the diff and waits for `shipd approve`.".into(),
         "approve" => "shipd approve SITE DIGEST [--allow routing,code]\n\nApproves the diff the site is waiting on. DIGEST is the digest printed with the diff (12 characters are enough). If the diff changes\nrouting or code files, say so with --allow. A different commit, a different digest or a missing word is refused, and nothing deploys.".into(),
+        "digest" => "shipd digest DIR\n\nPrints the SHA-256 over every path and file hash of a built folder. An approval and a deploy are held to it.".into(),
         "diff" => "shipd diff LIVE_DIR NEXT_DIR\n\nReads two built folders and says which files were added, removed or changed, by kind (pages, stylesheets,\nscripts, data, images, redirects), then lists the changed paths. Exit 0 whether or not they differ.".into(),
         _ => USAGE.into(),
     }

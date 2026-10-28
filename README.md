@@ -33,8 +33,13 @@ output line that starts with `version_line`) and the rollback line.
 4. **What ships is what was approved.** With a diff step, the candidate folder built for the diff is kept, its tree digest is carried in the
    state, and the deploy command is run with `SHIPD_APPROVED_DIR` set to it. A site's deploy script must ship that folder and not build again. shipd
    hashes the folder once more just before the deploy and refuses if it changed. A deploy script that ignores `SHIPD_APPROVED_DIR` and builds for
-   itself would ship a build nobody saw: the site's deploy script is part of the contract.
+   itself would ship a build nobody saw: the site's deploy script is part of the contract. It is held to it two ways. shipd sets
+   `SHIPD_APPROVED_DIGEST`, and the script should refuse to upload a folder with another digest. And after the deploy command, shipd requires a line
+   `Uploaded digest: <sha256>` in its output equal to the approved digest; a missing line or another digest is a failed deploy that says live may hold a
+   build nobody approved. The digest is the one `shipd digest DIR` prints, taken of the folder as the script received it, before the script adds its own files.
 5. **Hand deploys.** shipd sets `SHIPD_RELEASE=1` for the gates, the build and the deploy. A site's own deploy script refuses to deploy to production
    without it. This stops the accident, a hand run that builds the working tree; it is an ordinary environment variable and not a lock.
-6. **Commands stop.** Any one command (gate, build, deploy) is stopped after 30 minutes. Each build starts from a clean checkout (`git clean -fdx`).
+6. **Commands stop.** Any one command (gate, build, deploy, install) is stopped, with its whole process group, after `command_limit_seconds` (1800 when
+   left out), with a message. Each build starts from a clean checkout (`git clean -fdx`); a site that needs `node_modules` or the like sets
+   `install = ["bun", "install", "--frozen-lockfile"]`, which runs in every fresh checkout.
 7. **No remote.** `remote = "none"` makes the local branch the truth.
