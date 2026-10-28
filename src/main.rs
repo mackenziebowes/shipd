@@ -1,6 +1,7 @@
 //! shipd: a local watcher that deploys a site's main when every gate passes, and rolls back when the live check fails.
 //! This file is the adapter for the command line: it turns each command into one event or one query, and decides nothing.
 mod config;
+mod diff;
 mod driver;
 mod step;
 mod store;
@@ -22,6 +23,7 @@ Commands:
   watch [--once] [--dry-run]  check origin for each site; every 60 seconds unless --once
   rollback SITE [--dry-run]   redeploy the previous live/<n> tag
   mark-live SITE COMMIT       record a commit that a person deployed by hand
+  diff LIVE_DIR NEXT_DIR      say which files differ between two built folders
 
 The config is shipd.toml: $SHIPD_CONFIG, or ~/.config/shipd/shipd.toml, unless --config says otherwise.
 State and history are kept under $SHIPD_HOME, or ~/.local/share/shipd.
@@ -56,6 +58,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "watch" => watch(&config_path, &paths, rest),
         "rollback" => rollback(&config_path, &paths, rest),
         "mark-live" => mark_live(&config_path, &paths, rest),
+        "diff" => diff_command(rest),
         other => Err(format!("no command called \"{other}\". Try `shipd --help`.")),
     }
 }
@@ -184,6 +187,18 @@ fn help(command: &str) -> String {
         "watch" => "shipd watch [--once] [--dry-run]\n\nFor each site: git fetch origin, send origin's branch head to the state machine, and run what it\nasks for. Gates always run for real. With --dry-run, Deploy, Tag and Redeploy are only printed.\nWithout --once it repeats every 60 seconds.".into(),
         "rollback" => "shipd rollback SITE [--dry-run]\n\nSends a rollback request: the previous live/<n> tag is redeployed, and the failed commit is held\non main until main moves past it.".into(),
         "mark-live" => "shipd mark-live SITE COMMIT\n\nRecords that a person deployed COMMIT by hand. If shipd would have deployed the same commit in\ndry-run, that is counted as agreed; a different commit is disagreed.".into(),
+        "diff" => "shipd diff LIVE_DIR NEXT_DIR\n\nReads two built folders and says which files were added, removed or changed, by kind (pages, stylesheets,\nscripts, data, images, redirects), then lists the changed paths. Exit 0 whether or not they differ.".into(),
         _ => USAGE.into(),
     }
+}
+
+/// `shipd diff LIVE_DIR NEXT_DIR`: reads both folders and prints the difference. The same function the release step uses.
+fn diff_command(args: &[String]) -> Result<(), String> {
+    let pos = positional(args);
+    let [live, next] = pos.as_slice() else {
+        return Err("usage: shipd diff LIVE_DIR NEXT_DIR".into());
+    };
+    let summary = diff::diff_trees(&diff::Tree::read(std::path::Path::new(live.as_str()))?, &diff::Tree::read(std::path::Path::new(next.as_str()))?);
+    print!("{}", summary.render(40));
+    Ok(())
 }
