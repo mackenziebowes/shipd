@@ -2,22 +2,23 @@
 
 A local watcher that deploys a site's `main` when every gate passes, and rolls back when the live check fails.
 
-Stage 1: the state machine (`src/step.rs`, one `match`), a config parser, and a dry-run watcher. Personal-site runs in
-dry-run: its gates run for real, and deploys are only printed as `would deploy <commit>`.
+The state machine is `src/step.rs` (one `match`). A site in `dry-run` mode runs its gates for real and only prints `would deploy <commit>`.
+It needs Rust to build and, for the example config, whatever your site's gates and deploy script use. We run it with Cloudflare Workers
+(`wrangler`) and `bun`; nothing in shipd requires them.
 
 ```sh
 cargo build --release
 shipd --help
 shipd watch --once --dry-run     # one pass over every site
 shipd status                     # each site's state in words, and the dry-run count
-shipd rollback personal-site     # redeploy the previous live/<n>
-shipd mark-live personal-site <commit>
+shipd rollback my-site     # redeploy the previous live/<n>
+shipd mark-live my-site <commit>
 ```
 
-Config is `shipd.toml` (`$SHIPD_CONFIG`, or `~/.config/shipd/shipd.toml`). State and history live under
+Config is `shipd.toml` (copy `shipd.example.toml`; `$SHIPD_CONFIG`, or `~/.config/shipd/shipd.toml`). State and history live under
 `$SHIPD_HOME`, or `~/.local/share/shipd`. `shipd.service` is a user unit for `shipd watch`, not installed.
 
-## Release and the diff (#2644)
+## Release and the diff
 
 `shipd release SITE [--commit REV]` sends one commit that is on the site's branch through the same machine as `watch`: the gates in a clean
 worktree under `$SHIPD_HOME` (never /tmp), then, if the site has a `[site.diff]` section, the live commit and the candidate are both built into
@@ -58,3 +59,9 @@ output line that starts with `version_line`) and the rollback line.
    agree, so a cache that is still catching up is not recorded. A tag that went live before the site had `serve_check` has no fingerprint, so its first
    release is not checked. Checking `/` and `/sitemap.xml` catches pages added or removed, not an edited inner page: list more pages to catch those.
 10. **No remote.** `remote = "none"` makes the local branch the truth.
+
+## Known limits
+
+1. `shipd approve` does not re-run the served-page fingerprint at approval time.
+2. `release` does not compare the platform's active version id with the `live/<n>` tag before it diffs, so a hand deploy made outside shipd is not caught.
+3. `serve_check` covers only the URLs you list.

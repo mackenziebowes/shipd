@@ -1,0 +1,31 @@
+# Example config. Copy to ~/.config/shipd/shipd.toml (or point $SHIPD_CONFIG at it) and change the names, paths and commands.
+# Start every site in mode = "dry-run": gates run for real and deploys are only printed. A person changes the line to "live" once the
+# dry-run record has earned it; shipd never flips it.
+[[site]]
+name = "my-site"
+repo = "~/code/my-site"
+branch = "main"
+remote = "none"                          # omit to use the repo's origin; "none" means the local branch is the truth
+mode = "dry-run"                         # "dry-run" or "live"
+deploy = ["./deploy", "production"]      # run from a clean worktree; it must ship $SHIPD_APPROVED_DIR when a diff step is set
+version_line = "Current Version ID:"     # the deploy output line that names the platform's version id
+serve_check = ["https://example.com/", "https://example.com/sitemap.xml"]   # pages fetched after the deploy
+
+[[site.gates]]
+name = "build"
+command = ["sh", "-c", "make build"]
+
+[[site.gates]]
+name = "tests"
+command = ["sh", "-c", "make test"]
+
+# Optional. Builds the live commit and the candidate into $SHIPD_OUT and compares them before the deploy.
+[site.diff]
+mode = "hold"                            # "show" prints the diff and goes on; "hold" waits for `shipd approve SITE DIGEST`
+build = ["sh", "-c", "make build OUT=$SHIPD_OUT"]
+deploy_files = ["deploy", "wrangler*.jsonc"]   # git pathspecs of the deploy files; a change to them needs --allow deploy
+
+# After the deploy, each url must answer 200 and must not contain any of the strings.
+[[site.verify]]
+url = "https://example.com/"
+must_not_contain = []
